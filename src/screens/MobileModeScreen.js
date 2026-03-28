@@ -11,8 +11,11 @@ import * as Location from 'expo-location';
 import { LOCATIONS } from '../constants/locations';
 import {
   calculateNavigation,
-  getLocationById
+  getLocationById,
+  buildWalkGraph,
+  getRouteSteps
 } from '../services/navigationService';
+import USF_MAP from '../../assets/USF_Map.json';
 import {
   speak,
   stopSpeaking
@@ -27,6 +30,10 @@ export default function MobileModeScreen() {
   const [selectedDestination, setSelectedDestination] = useState(null);
   const [currentLocation, setCurrentLocation] = useState(null);
   const [navigationInfo, setNavigationInfo] = useState(null);
+  const [routeSteps, setRouteSteps] = useState([]);
+  const [routeStepIndex, setRouteStepIndex] = useState(0);
+  const [destinationLocation, setDestinationLocation] = useState(null);
+  const [modelLoaded, setModelLoaded] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [errorMessage, setErrorMessage] = useState(null);
   const [currentMode, setCurrentMode] = useState('navigate');
@@ -36,6 +43,15 @@ export default function MobileModeScreen() {
   const lastLocationTime = useRef(0);
   const analysisInterval = useRef(null);
   const locationSubscription = useRef(null);
+
+  // Build walk graph from campus GeoJSON
+  useEffect(() => {
+    try {
+      buildWalkGraph(USF_MAP);
+    } catch (err) {
+      console.warn('Failed to build map graph:', err);
+    }
+  }, []);
 
   // Request permissions
   useEffect(() => {
@@ -106,15 +122,26 @@ export default function MobileModeScreen() {
     };
   }, [hasLocationPermission]);
 
-  // Update navigation info
+  // Update navigation info and path instructions
   useEffect(() => {
     if (!currentLocation || !selectedDestination) return;
 
     const destination = getLocationById(selectedDestination);
     if (!destination) return;
 
+    setDestinationLocation(destination);
+
     const nav = calculateNavigation(currentLocation, destination);
     setNavigationInfo(nav);
+
+    // Recompute path steps from current location to destination
+    const steps = getRouteSteps(currentLocation, {
+      latitude: destination.latitude,
+      longitude: destination.longitude,
+      name: destination.name
+    });
+    setRouteSteps(steps);
+    setRouteStepIndex(0);
 
     const now = Date.now();
     if (now - lastNavigationTime.current > 3000) {
@@ -122,6 +149,13 @@ export default function MobileModeScreen() {
       speak(nav.instruction);
     }
   }, [currentLocation, selectedDestination]);
+
+  useEffect(() => {
+    if (routeSteps.length === 0) return;
+    const current = routeSteps[Math.min(routeStepIndex, routeSteps.length - 1)];
+    if (!current) return;
+    speak(current.text);
+  }, [routeSteps, routeStepIndex]);
 
   const analyzeCurrentScene = async () => {
     if (!cameraRef.current || !cameraReady) return;
