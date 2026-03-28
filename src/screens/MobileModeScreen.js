@@ -1,45 +1,40 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   ScrollView,
-  Dimensions,
-  Platform
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
-import { LOCATIONS, DETECTION_OBJECTS } from '../constants/locations';
+import { LOCATIONS } from '../constants/locations';
 import {
   calculateNavigation,
   getLocationById
 } from '../services/navigationService';
 import {
   speak,
-  stopSpeaking,
-  formatDetectionSpeech
+  stopSpeaking
 } from '../services/speechService';
-import { loadModel, detectObjects, filterRelevantObjects } from '../services/detectionService';
-
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
+import { analyzeScene } from '../services/detectionService';
 
 export default function MobileModeScreen() {
   const [hasPermission, requestCameraPermission] = useCameraPermissions();
   const [hasLocationPermission, setHasLocationPermission] = useState(null);
-  const [isDetecting, setIsDetecting] = useState(false);
-  const [detections, setDetections] = useState([]);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState(null);
   const [selectedDestination, setSelectedDestination] = useState(null);
   const [currentLocation, setCurrentLocation] = useState(null);
   const [navigationInfo, setNavigationInfo] = useState(null);
-  const [modelLoaded, setModelLoaded] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [errorMessage, setErrorMessage] = useState(null);
+  const [currentMode, setCurrentMode] = useState('navigate');
 
   const cameraRef = useRef(null);
   const lastNavigationTime = useRef(0);
   const lastLocationTime = useRef(0);
-  const detectionInterval = useRef(null);
+  const analysisInterval = useRef(null);
   const locationSubscription = useRef(null);
 
   // Request permissions
@@ -97,7 +92,7 @@ export default function MobileModeScreen() {
         }
       } catch (error) {
         console.warn('Location access error:', error);
-        setErrorMessage('Location unavailable: ' + (error.message || 'Timed out')); 
+        setErrorMessage('Location unavailable: ' + (error.message || 'Timed out'));
       }
     };
 
@@ -128,79 +123,78 @@ export default function MobileModeScreen() {
     }
   }, [currentLocation, selectedDestination]);
 
-  // Start/stop detection
-  const toggleDetection = async () => {
-    if (isDetecting) {
-      stopDetection();
+  const analyzeCurrentScene = async () => {
+    if (!cameraRef.current || !cameraReady) return;
+
+    try {
+      const image = await cameraRef.current.takePictureAsync({
+        quality: 0.5,
+        base64: false,
+        skipProcessing: true
+      });
+
+      if (image && image.uri) {
+        const destination = selectedDestination ? getLocationById(selectedDestination) : null;
+
+        const result = await analyzeScene({
+          imageUri: image.uri,
+          mode: currentMode,
+          destination: destination?.name || null,
+        });
+
+        setAnalysisResult(result);
+        speak(result);
+      }
+    } catch (error) {
+      console.error('Analysis error:', error);
+      setErrorMessage('Analysis failed. Please try again.');
+    }
+  };
+
+  // Start/stop analysis
+  const toggleAnalysis = async () => {
+    if (isAnalyzing) {
+      stopAnalysis();
     } else {
-      startDetection();
+      startAnalysis();
     }
   };
 
-  const startDetection = async () => {
-    // Load model if not already loaded
-    if (!modelLoaded) {
-      speak('Loading detection model. Please wait.');
-      setErrorMessage(null);
-      try {
-        await loadModel();
-        setModelLoaded(true);
-      } catch (error) {
-        console.log('Model loading error:', error);
-        setErrorMessage('Model load failed; object detection unavailable. Use Simulate Demo.');
-        speak('Model failed to load. Use simulate demo instead.');
-        return;
-      }
+  const startAnalysis = async () => {
+    if (!cameraReady) {
+      setErrorMessage('Camera not ready. Please wait.');
+      return;
     }
 
-    setIsDetecting(true);
-    speak('Detection started');
+    setIsAnalyzing(true);
+    setErrorMessage(null);
+    speak('Scene analysis started');
 
-    detectionInterval.current = setInterval(async () => {
-      if (cameraRef.current && cameraReady) {
-        try {
-          const image = await cameraRef.current.takePictureAsync({
-            quality: 0.4,
-            base64: false,
-            skipProcessing: true
-          });
-          if (image && image.uri) {
-            const results = await detectObjects(image.uri);
-            if (results.length > 0) {
-              const filtered = filterRelevantObjects(results, DETECTION_OBJECTS);
-              if (filtered.length > 0) {
-                setDetections(filtered);
-                const speech = formatDetectionSpeech(filtered);
-                if (speech) speak(speech);
-              }
-            }
-          }
-        } catch (error) {
-          console.log('Capture error:', error);
-        }
-      }
-    }, 1500);
+    // Initial analysis
+    await analyzeCurrentScene();
+
+    // Set up continuous analysis every 15 seconds (5 per minute limit)
+    analysisInterval.current = setInterval(async () => {
+      await analyzeCurrentScene();
+    }, 15000);
   };
 
-  const stopDetection = () => {
-    if (detectionInterval.current) {
-      clearInterval(detectionInterval.current);
-      detectionInterval.current = null;
+  const stopAnalysis = () => {
+    if (analysisInterval.current) {
+      clearInterval(analysisInterval.current);
+      analysisInterval.current = null;
     }
-    setIsDetecting(false);
-    setDetections([]);
-    speak('Detection stopped');
+    setIsAnalyzing(false);
+    stopSpeaking();
+    speak('Scene analysis stopped');
   };
 
-  // Simulate detection for demo (since actual TF.js on mobile needs extra setup)
-  const simulateDetection = () => {
-    const mockDetections = [
-      { class: 'person', score: 0.92, bbox: [100, 150, 80, 200] },
-      { class: 'chair', score: 0.85, bbox: [300, 250, 100, 100] }
-    ];
-    setDetections(mockDetections);
-    const speech = formatDetectionSpeech(mockDetections);
-    speak(speech);
+  const modeLabels = {
+    navigate: 'Navigate',
+    read: 'Read Text',
+    identify: 'Identify',
+    panic: 'Help!',
+    followup: 'Follow-up'
   };
 
   if (hasPermission === null) {
@@ -230,16 +224,10 @@ export default function MobileModeScreen() {
           onCameraReady={() => setCameraReady(true)}
           ratio="16:9"
         />
-        {/* Detection overlay */}
-        {detections.length > 0 && (
-          <View style={styles.overlay}>
-            {detections.map((d, i) => (
-              <View key={i} style={styles.detectionBadge}>
-                <Text style={styles.detectionText}>
-                  {d.class} {Math.round(d.score * 100)}%
-                </Text>
-              </View>
-            ))}
+        {/* Analysis status overlay */}
+        {isAnalyzing && (
+          <View style={styles.analyzingBadge}>
+            <Text style={styles.analyzingText}>ANALYZING</Text>
           </View>
         )}
       </View>
@@ -247,10 +235,10 @@ export default function MobileModeScreen() {
       {/* Status Bar */}
       <View style={styles.statusBar}>
         <Text style={styles.statusLabel}>
-          Model: {modelLoaded ? 'Ready' : 'Loading...'}
+          Mode: {modeLabels[currentMode] || 'Navigate'}
         </Text>
         <Text style={styles.statusLabel}>
-          Detection: {isDetecting ? 'ON' : 'OFF'}
+          {isAnalyzing ? 'LIVE' : 'STOPPED'}
         </Text>
       </View>
 
@@ -271,22 +259,46 @@ export default function MobileModeScreen() {
         </View>
       )}
 
+      {/* Analysis Result */}
+      {analysisResult && (
+        <ScrollView style={styles.resultContainer}>
+          <Text style={styles.resultText}>{analysisResult}</Text>
+        </ScrollView>
+      )}
+
+      {/* Mode Selector */}
+      <View style={styles.modeSelector}>
+        <Text style={styles.modeLabel}>Mode:</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.modeScroll}>
+          {Object.entries(modeLabels).map(([key, label]) => (
+            <TouchableOpacity
+              key={key}
+              style={[
+                styles.modeButton,
+                currentMode === key && styles.modeButtonActive
+              ]}
+              onPress={() => setCurrentMode(key)}
+            >
+              <Text style={[
+                styles.modeButtonText,
+                currentMode === key && styles.modeButtonTextActive
+              ]}>
+                {label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+      </View>
+
       {/* Controls */}
       <View style={styles.controls}>
         <TouchableOpacity
-          style={[styles.button, isDetecting && styles.buttonActive]}
-          onPress={toggleDetection}
+          style={[styles.button, isAnalyzing && styles.buttonActive]}
+          onPress={toggleAnalysis}
         >
           <Text style={styles.buttonText}>
-            {isDetecting ? 'Stop' : 'Start Detection'}
+            {isAnalyzing ? 'Stop Analysis' : 'Start Analysis'}
           </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={styles.buttonSecondary}
-          onPress={simulateDetection}
-        >
-          <Text style={styles.buttonText}>Simulate Demo</Text>
         </TouchableOpacity>
       </View>
 
@@ -317,29 +329,23 @@ const styles = StyleSheet.create({
     backgroundColor: '#0a0a15'
   },
   cameraContainer: {
-    height: '45%',
+    height: '35%',
     backgroundColor: '#000'
   },
   camera: {
     flex: 1
   },
-  overlay: {
+  analyzingBadge: {
     position: 'absolute',
     top: 10,
-    left: 10,
     right: 10,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8
+    backgroundColor: '#d94a4a',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8
   },
-  detectionBadge: {
-    backgroundColor: 'rgba(0, 255, 0, 0.8)',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12
-  },
-  detectionText: {
-    color: '#000',
+  analyzingText: {
+    color: '#fff',
     fontWeight: 'bold',
     fontSize: 12
   },
@@ -369,9 +375,55 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginTop: 4
   },
+  resultContainer: {
+    maxHeight: 150,
+    padding: 15,
+    backgroundColor: '#1a1a2e',
+    marginHorizontal: 20,
+    borderRadius: 10,
+    marginTop: 10
+  },
+  resultText: {
+    color: '#fff',
+    fontSize: 14,
+    lineHeight: 20
+  },
+  modeSelector: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    gap: 10
+  },
+  modeLabel: {
+    color: '#888',
+    fontSize: 12
+  },
+  modeScroll: {
+    flexDirection: 'row'
+  },
+  modeButton: {
+    backgroundColor: '#2a2a3e',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 16,
+    marginRight: 8
+  },
+  modeButtonActive: {
+    backgroundColor: '#4a90d9'
+  },
+  modeButtonText: {
+    color: '#888',
+    fontSize: 12
+  },
+  modeButtonTextActive: {
+    color: '#fff',
+    fontWeight: '600'
+  },
   controls: {
     flexDirection: 'row',
-    padding: 15,
+    paddingHorizontal: 20,
+    paddingBottom: 10,
     gap: 10
   },
   button: {
@@ -383,13 +435,6 @@ const styles = StyleSheet.create({
   },
   buttonActive: {
     backgroundColor: '#d94a4a'
-  },
-  buttonSecondary: {
-    flex: 1,
-    backgroundColor: '#2a4a2a',
-    padding: 15,
-    borderRadius: 10,
-    alignItems: 'center'
   },
   buttonText: {
     color: '#fff',
