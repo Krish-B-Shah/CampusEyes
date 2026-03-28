@@ -1,493 +1,313 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  ScrollView,
+  View, Text, TouchableOpacity, ScrollView,
+  StyleSheet, SafeAreaView, Alert
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
-import { LOCATIONS } from '../constants/locations';
-import {
-  calculateNavigation,
-  getLocationById
-} from '../services/navigationService';
-import {
-  speak,
-  stopSpeaking
-} from '../services/speechService';
 import { analyzeScene } from '../services/detectionService';
+import { speak, stopSpeaking } from '../services/speechService';
+import { calculateNavigation, getLocationById } from '../services/navigationService';
+import { LOCATIONS } from '../constants/locations';
+
+const MODES = ['navigate', 'read', 'identify'];
+const MODE_LABELS = { navigate: '🧭 Navigate', read: '📖 Read', identify: '🔍 Identify' };
 
 export default function MobileModeScreen() {
-  const [hasPermission, requestCameraPermission] = useCameraPermissions();
-  const [hasLocationPermission, setHasLocationPermission] = useState(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState(null);
-  const [selectedDestination, setSelectedDestination] = useState(null);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [locationPermission, setLocationPermission] = useState(false);
   const [currentLocation, setCurrentLocation] = useState(null);
-  const [navigationInfo, setNavigationInfo] = useState(null);
-  const [cameraReady, setCameraReady] = useState(false);
-  const [errorMessage, setErrorMessage] = useState(null);
+  const [selectedDestination, setSelectedDestination] = useState(null);
   const [currentMode, setCurrentMode] = useState('navigate');
+  const [isScanning, setIsScanning] = useState(false);
+  const [lastResponse, setLastResponse] = useState('');
+  const [conversationHistory, setConversationHistory] = useState([]);
+  const [lastImageBase64, setLastImageBase64] = useState(null);
+  const [memoryContext, setMemoryContext] = useState(null);
+  const [communityHazards, setCommunityHazards] = useState([]);
+  const [navigationInfo, setNavigationInfo] = useState(null);
+  const [isListening, setIsListening] = useState(false);
 
   const cameraRef = useRef(null);
-  const lastNavigationTime = useRef(0);
-  const lastLocationTime = useRef(0);
-  const analysisInterval = useRef(null);
-  const locationSubscription = useRef(null);
+  const navIntervalRef = useRef(null);
 
-  // Request permissions
+  // --- PERMISSIONS ---
   useEffect(() => {
-    (async () => {
-      if (hasPermission === null) {
-        await requestCameraPermission();
-      }
-
-      const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
-      setHasLocationPermission(locationStatus === 'granted');
-
-    })();
+    requestCameraPermission();
+    requestLocationPermission();
   }, []);
 
-  // Get location updates
-  useEffect(() => {
-    if (!hasLocationPermission) return;
-
-    let active = true;
-
-    const subscribeToLocation = async () => {
-      try {
-        const location = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.High,
-          timeout: 15000,
-          maximumAge: 1000
-        });
-
-        if (active) {
-          setCurrentLocation({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-            heading: location.coords.heading || 0
-          });
-
-          locationSubscription.current = await Location.watchPositionAsync(
-            {
-              accuracy: Location.Accuracy.High,
-              timeInterval: 1000,
-              distanceInterval: 1
-            },
-            (locationUpdate) => {
-              const now = Date.now();
-              if (now - lastLocationTime.current > 1000) {
-                lastLocationTime.current = now;
-                setCurrentLocation({
-                  latitude: locationUpdate.coords.latitude,
-                  longitude: locationUpdate.coords.longitude,
-                  heading: locationUpdate.coords.heading || 0
-                });
-              }
-            }
-          );
-        }
-      } catch (error) {
-        console.warn('Location access error:', error);
-        setErrorMessage('Location unavailable: ' + (error.message || 'Timed out'));
-      }
-    };
-
-    subscribeToLocation();
-
-    return () => {
-      active = false;
-      if (locationSubscription.current) {
-        locationSubscription.current.remove();
-      }
-    };
-  }, [hasLocationPermission]);
-
-  // Update navigation info
-  useEffect(() => {
-    if (!currentLocation || !selectedDestination) return;
-
-    const destination = getLocationById(selectedDestination);
-    if (!destination) return;
-
-    const nav = calculateNavigation(currentLocation, destination);
-    setNavigationInfo(nav);
-
-    const now = Date.now();
-    if (now - lastNavigationTime.current > 3000) {
-      lastNavigationTime.current = now;
-      speak(nav.instruction);
+  const requestLocationPermission = async () => {
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status === 'granted') {
+      setLocationPermission(true);
+      startLocationTracking();
     }
+  };
+
+  // --- LOCATION TRACKING ---
+  const startLocationTracking = async () => {
+    await Location.watchPositionAsync(
+      { accuracy: Location.Accuracy.High, timeInterval: 1000, distanceInterval: 2 },
+      (loc) => setCurrentLocation(loc.coords)
+    );
+  };
+
+  // --- NAVIGATION UPDATES ---
+  useEffect(() => {
+    if (navIntervalRef.current) clearInterval(navIntervalRef.current);
+    if (currentLocation && selectedDestination) {
+      navIntervalRef.current = setInterval(() => {
+        const dest = getLocationById(selectedDestination);
+        if (!dest) return;
+        const info = calculateNavigation(currentLocation, dest);
+        setNavigationInfo(info);
+        if (info) speak(info.instruction);
+      }, 4000);
+    }
+    return () => clearInterval(navIntervalRef.current);
   }, [currentLocation, selectedDestination]);
 
-  const analyzeCurrentScene = async () => {
-    if (!cameraRef.current || !cameraReady) return;
+  // --- MAIN SCAN ---
+  const handleScan = async () => {
+    if (!cameraRef.current || isScanning) return;
+    setIsScanning(true);
+    speak('Scanning...');
 
     try {
-      const image = await cameraRef.current.takePictureAsync({
-        quality: 0.5,
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.7,
         base64: false,
-        skipProcessing: true
       });
 
-      if (image && image.uri) {
-        const destination = selectedDestination ? getLocationById(selectedDestination) : null;
+      const response = await analyzeScene({
+        imageUri: photo.uri,
+        mode: currentMode,
+        conversationHistory,
+        memoryContext,
+        communityHazards,
+        destination: selectedDestination
+          ? getLocationById(selectedDestination)?.name
+          : null,
+      });
 
-        const result = await analyzeScene({
-          imageUri: image.uri,
-          mode: currentMode,
-          destination: destination?.name || null,
-        });
+      setLastResponse(response);
+      speak(response, true);
 
-        setAnalysisResult(result);
-        speak(result);
-      }
-    } catch (error) {
-      console.error('Analysis error:', error);
-      setErrorMessage('Analysis failed. Please try again.');
+      // Save to conversation history for follow-ups
+      setConversationHistory(prev => [
+        ...prev,
+        {
+          role: 'user',
+          parts: [{ text: `[Scene scanned in ${currentMode} mode]` }]
+        },
+        {
+          role: 'model',
+          parts: [{ text: response }]
+        }
+      ]);
+
+    } catch (err) {
+      console.error('Scan error:', err);
+      speak('Scan failed. Please try again.');
+    } finally {
+      setIsScanning(false);
     }
   };
 
-  // Start/stop analysis
-  const toggleAnalysis = async () => {
-    if (isAnalyzing) {
-      stopAnalysis();
-    } else {
-      startAnalysis();
-    }
-  };
-
-  const startAnalysis = async () => {
-    if (!cameraReady) {
-      setErrorMessage('Camera not ready. Please wait.');
+  // --- VOICE FOLLOW-UP ---
+  // Person 2 will pass memoryContext and communityHazards as props/state
+  // This function handles text follow-ups (voice recognition can be added)
+  const handleFollowUp = async (question) => {
+    if (!lastResponse) {
+      speak('Please scan first before asking a question.');
       return;
     }
 
-    setIsAnalyzing(true);
-    setErrorMessage(null);
-    speak('Scene analysis started');
+    const response = await analyzeScene({
+      imageUri: null, // no new image needed
+      mode: 'followup',
+      conversationHistory,
+      memoryContext,
+      communityHazards,
+      destination: selectedDestination
+        ? getLocationById(selectedDestination)?.name
+        : null,
+      userQuestion: question,
+    });
 
-    // Initial analysis
-    await analyzeCurrentScene();
+    setLastResponse(response);
+    speak(response, true);
 
-    // Set up continuous analysis every 15 seconds (5 per minute limit)
-    analysisInterval.current = setInterval(async () => {
-      await analyzeCurrentScene();
-    }, 15000);
+    setConversationHistory(prev => [
+      ...prev,
+      { role: 'user', parts: [{ text: question }] },
+      { role: 'model', parts: [{ text: response }] }
+    ]);
   };
 
-  const stopAnalysis = () => {
-    if (analysisInterval.current) {
-      clearInterval(analysisInterval.current);
-      analysisInterval.current = null;
+  // --- PANIC BUTTON ---
+  const handlePanic = async () => {
+    if (!cameraRef.current) return;
+    speak('Locating you now. Please hold still.', true);
+    setIsScanning(true);
+
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.7 });
+      const response = await analyzeScene({
+        imageUri: photo.uri,
+        mode: 'panic',
+        conversationHistory: [],
+        memoryContext,
+        communityHazards,
+        destination: selectedDestination
+          ? getLocationById(selectedDestination)?.name
+          : null,
+      });
+
+      setLastResponse(response);
+      speak(response, true);
+      setConversationHistory([]);
+    } catch (err) {
+      speak('Could not locate you. Please try again.');
+    } finally {
+      setIsScanning(false);
     }
-    setIsAnalyzing(false);
-    stopSpeaking();
-    speak('Scene analysis stopped');
   };
 
-  const modeLabels = {
-    navigate: 'Navigate',
-    read: 'Read Text',
-    identify: 'Identify',
-    panic: 'Help!',
-    followup: 'Follow-up'
-  };
+  // --- EXPOSE SETTERS FOR PERSON 2 INTEGRATION ---
+  // Person 2 will call these from their service layer:
+  // setMemoryContext(memoryString)
+  // setCommunityHazards(hazardsArray)
 
-  if (hasPermission === null) {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.statusText}>Requesting permissions...</Text>
-      </View>
-    );
-  }
-
-  if (!hasPermission?.granted || hasLocationPermission === null) {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.statusText}>Camera and location permissions required</Text>
-      </View>
-    );
-  }
+  if (!cameraPermission) return <View style={styles.container}><Text style={styles.text}>Requesting permissions...</Text></View>;
+  if (!cameraPermission.granted) return (
+    <View style={styles.container}>
+      <Text style={styles.text}>Camera access required for CampusEyes.</Text>
+      <TouchableOpacity style={styles.button} onPress={requestCameraPermission}>
+        <Text style={styles.buttonText}>Grant Camera Access</Text>
+      </TouchableOpacity>
+    </View>
+  );
 
   return (
-    <View style={styles.container}>
-      {/* Camera View */}
+    <SafeAreaView style={styles.container}>
+
+      {/* CAMERA */}
       <View style={styles.cameraContainer}>
-        <CameraView
-          ref={cameraRef}
-          style={styles.camera}
-          facing="back"
-          onCameraReady={() => setCameraReady(true)}
-          ratio="16:9"
-        />
-        {/* Analysis status overlay */}
-        {isAnalyzing && (
-          <View style={styles.analyzingBadge}>
-            <Text style={styles.analyzingText}>ANALYZING</Text>
-          </View>
-        )}
+        <CameraView ref={cameraRef} style={styles.camera} facing="back" />
       </View>
 
-      {/* Status Bar */}
-      <View style={styles.statusBar}>
-        <Text style={styles.statusLabel}>
-          Mode: {modeLabels[currentMode] || 'Navigate'}
-        </Text>
-        <Text style={styles.statusLabel}>
-          {isAnalyzing ? 'LIVE' : 'STOPPED'}
-        </Text>
+      {/* MODE TOGGLE */}
+      <View style={styles.modeRow}>
+        {MODES.map(mode => (
+          <TouchableOpacity
+            key={mode}
+            style={[styles.modeButton, currentMode === mode && styles.modeButtonActive]}
+            onPress={() => setCurrentMode(mode)}
+          >
+            <Text style={[styles.modeText, currentMode === mode && styles.modeTextActive]}>
+              {MODE_LABELS[mode]}
+            </Text>
+          </TouchableOpacity>
+        ))}
       </View>
 
-      {/* Error message */}
-      {errorMessage && (
-        <View style={styles.errorInfo}>
-          <Text style={styles.errorText}>{errorMessage}</Text>
-        </View>
-      )}
+      {/* RESPONSE */}
+      <ScrollView style={styles.responseBox}>
+        <Text style={styles.responseText}>
+          {lastResponse || 'Tap Scan to analyze your surroundings.'}
+        </Text>
+      </ScrollView>
 
-      {/* Navigation Info */}
+      {/* NAVIGATION INFO */}
       {navigationInfo && (
-        <View style={styles.navInfo}>
-          <Text style={styles.navText}>{navigationInfo.instruction}</Text>
-          <Text style={styles.navSubtext}>
-            {navigationInfo.distance}m away
+        <View style={styles.navBanner}>
+          <Text style={styles.navText}>
+            {navigationInfo.instruction} ({Math.round(navigationInfo.distance)}m)
           </Text>
         </View>
       )}
 
-      {/* Analysis Result */}
-      {analysisResult && (
-        <ScrollView style={styles.resultContainer}>
-          <Text style={styles.resultText}>{analysisResult}</Text>
-        </ScrollView>
+      {/* COMMUNITY HAZARD BANNER */}
+      {communityHazards.length > 0 && (
+        <View style={styles.hazardBanner}>
+          <Text style={styles.hazardText}>
+            ⚠️ {communityHazards[0].description} reported nearby
+          </Text>
+        </View>
       )}
 
-      {/* Mode Selector */}
-      <View style={styles.modeSelector}>
-        <Text style={styles.modeLabel}>Mode:</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.modeScroll}>
-          {Object.entries(modeLabels).map(([key, label]) => (
-            <TouchableOpacity
-              key={key}
-              style={[
-                styles.modeButton,
-                currentMode === key && styles.modeButtonActive
-              ]}
-              onPress={() => setCurrentMode(key)}
-            >
-              <Text style={[
-                styles.modeButtonText,
-                currentMode === key && styles.modeButtonTextActive
-              ]}>
-                {label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
-      </View>
+      {/* MAIN SCAN BUTTON */}
+      <TouchableOpacity
+        style={[styles.scanButton, isScanning && styles.scanButtonDisabled]}
+        onPress={handleScan}
+        disabled={isScanning}
+        accessibilityLabel="Scan surroundings"
+        accessibilityRole="button"
+      >
+        <Text style={styles.scanButtonText}>
+          {isScanning ? 'Scanning...' : '👁️ SCAN'}
+        </Text>
+      </TouchableOpacity>
 
-      {/* Controls */}
-      <View style={styles.controls}>
-        <TouchableOpacity
-          style={[styles.button, isAnalyzing && styles.buttonActive]}
-          onPress={toggleAnalysis}
-        >
-          <Text style={styles.buttonText}>
-            {isAnalyzing ? 'Stop Analysis' : 'Start Analysis'}
-          </Text>
-        </TouchableOpacity>
-      </View>
+      {/* PANIC BUTTON */}
+      <TouchableOpacity
+        style={styles.panicButton}
+        onPress={handlePanic}
+        accessibilityLabel="I am lost, help me"
+      >
+        <Text style={styles.panicText}>🆘 I'M LOST</Text>
+      </TouchableOpacity>
 
-      {/* Destination Selector */}
-      <Text style={styles.sectionTitle}>Select Destination</Text>
-      <ScrollView style={styles.destinationList}>
-        {LOCATIONS.map((loc) => (
+      {/* DESTINATION SELECTOR */}
+      <ScrollView horizontal style={styles.destinationRow}>
+        {LOCATIONS.map(loc => (
           <TouchableOpacity
             key={loc.id}
             style={[
-              styles.destinationItem,
-              selectedDestination === loc.id && styles.destinationSelected
+              styles.destButton,
+              selectedDestination === loc.id && styles.destButtonActive
             ]}
-            onPress={() => setSelectedDestination(loc.id)}
+            onPress={() => {
+              setSelectedDestination(loc.id);
+              speak(`Navigating to ${loc.name}`);
+            }}
           >
-            <Text style={styles.destinationName}>{loc.name}</Text>
-            <Text style={styles.destinationDesc}>{loc.description}</Text>
+            <Text style={styles.destText}>{loc.name}</Text>
           </TouchableOpacity>
         ))}
       </ScrollView>
-    </View>
+
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0a0a15'
-  },
-  cameraContainer: {
-    height: '35%',
-    backgroundColor: '#000'
-  },
-  camera: {
-    flex: 1
-  },
-  analyzingBadge: {
-    position: 'absolute',
-    top: 10,
-    right: 10,
-    backgroundColor: '#d94a4a',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8
-  },
-  analyzingText: {
-    color: '#fff',
-    fontWeight: 'bold',
-    fontSize: 12
-  },
-  statusBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    backgroundColor: '#1a1a2e'
-  },
-  statusLabel: {
-    color: '#888',
-    fontSize: 12
-  },
-  navInfo: {
-    backgroundColor: '#1a3a1a',
-    padding: 15,
-    alignItems: 'center'
-  },
-  navText: {
-    color: '#0f0',
-    fontSize: 20,
-    fontWeight: 'bold'
-  },
-  navSubtext: {
-    color: '#0a0',
-    fontSize: 14,
-    marginTop: 4
-  },
-  resultContainer: {
-    maxHeight: 150,
-    padding: 15,
-    backgroundColor: '#1a1a2e',
-    marginHorizontal: 20,
-    borderRadius: 10,
-    marginTop: 10
-  },
-  resultText: {
-    color: '#fff',
-    fontSize: 14,
-    lineHeight: 20
-  },
-  modeSelector: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    gap: 10
-  },
-  modeLabel: {
-    color: '#888',
-    fontSize: 12
-  },
-  modeScroll: {
-    flexDirection: 'row'
-  },
-  modeButton: {
-    backgroundColor: '#2a2a3e',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 16,
-    marginRight: 8
-  },
-  modeButtonActive: {
-    backgroundColor: '#4a90d9'
-  },
-  modeButtonText: {
-    color: '#888',
-    fontSize: 12
-  },
-  modeButtonTextActive: {
-    color: '#fff',
-    fontWeight: '600'
-  },
-  controls: {
-    flexDirection: 'row',
-    paddingHorizontal: 20,
-    paddingBottom: 10,
-    gap: 10
-  },
-  button: {
-    flex: 1,
-    backgroundColor: '#4a90d9',
-    padding: 15,
-    borderRadius: 10,
-    alignItems: 'center'
-  },
-  buttonActive: {
-    backgroundColor: '#d94a4a'
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: '600'
-  },
-  sectionTitle: {
-    color: '#888',
-    fontSize: 12,
-    paddingHorizontal: 20,
-    marginBottom: 8
-  },
-  destinationList: {
-    flex: 1,
-    paddingHorizontal: 20
-  },
-  destinationItem: {
-    backgroundColor: '#1a1a2e',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 10
-  },
-  destinationSelected: {
-    backgroundColor: '#2a4a6a',
-    borderWidth: 1,
-    borderColor: '#4a90d9'
-  },
-  destinationName: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600'
-  },
-  destinationDesc: {
-    color: '#888',
-    fontSize: 12,
-    marginTop: 4
-  },
-  statusText: {
-    color: '#888',
-    fontSize: 16,
-    textAlign: 'center',
-    marginTop: 50
-  },
-  errorInfo: {
-    padding: 10,
-    backgroundColor: 'rgba(255, 0, 0, 0.2)',
-    marginHorizontal: 20,
-    borderRadius: 8,
-    marginTop: 10
-  },
-  errorText: {
-    color: '#fff',
-    fontSize: 13,
-    textAlign: 'center'
-  }
+  container: { flex: 1, backgroundColor: '#000' },
+  text: { color: '#fff', fontSize: 18, textAlign: 'center', margin: 20 },
+  cameraContainer: { flex: 1, maxHeight: 300 },
+  camera: { flex: 1 },
+  modeRow: { flexDirection: 'row', justifyContent: 'space-around', padding: 8, backgroundColor: '#111' },
+  modeButton: { padding: 8, borderRadius: 8, backgroundColor: '#222' },
+  modeButtonActive: { backgroundColor: '#2563eb' },
+  modeText: { color: '#aaa', fontSize: 13 },
+  modeTextActive: { color: '#fff', fontWeight: 'bold' },
+  responseBox: { maxHeight: 120, backgroundColor: '#111', margin: 8, borderRadius: 8, padding: 10 },
+  responseText: { color: '#fff', fontSize: 15, lineHeight: 22 },
+  navBanner: { backgroundColor: '#1d4ed8', padding: 8, margin: 8, borderRadius: 8 },
+  navText: { color: '#fff', fontSize: 14, textAlign: 'center' },
+  hazardBanner: { backgroundColor: '#dc2626', padding: 8, margin: 8, borderRadius: 8 },
+  hazardText: { color: '#fff', fontSize: 14, textAlign: 'center' },
+  scanButton: { backgroundColor: '#2563eb', margin: 12, padding: 20, borderRadius: 16, alignItems: 'center' },
+  scanButtonDisabled: { backgroundColor: '#555' },
+  scanButtonText: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
+  panicButton: { backgroundColor: '#dc2626', margin: 12, marginTop: 0, padding: 14, borderRadius: 16, alignItems: 'center' },
+  panicText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  destinationRow: { paddingHorizontal: 8, paddingBottom: 8, maxHeight: 60 },
+  destButton: { backgroundColor: '#222', padding: 10, borderRadius: 8, marginRight: 8, minWidth: 100, alignItems: 'center' },
+  destButtonActive: { backgroundColor: '#065f46' },
+  destText: { color: '#fff', fontSize: 13 },
+  button: { backgroundColor: '#2563eb', padding: 16, margin: 20, borderRadius: 12, alignItems: 'center' },
+  buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
 });
