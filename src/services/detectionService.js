@@ -1,25 +1,34 @@
 import '@tensorflow/tfjs-react-native';
+import { decodeJpeg } from '@tensorflow/tfjs-react-native';
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 
 let model = null;
 let modelLoading = false;
+let modelPromise = null;
 
 export async function loadModel() {
   if (model) return model;
-  if (modelLoading) {
-    // Wait for existing load to complete
-    while (!model) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    return model;
+  if (modelPromise) {
+    // If loading is already in progress, wait for the same promise
+    return modelPromise;
   }
 
   modelLoading = true;
-  try {
-    // Set up TensorFlow.js for React Native
-      await tf.ready();
-      await tf.setBackend('cpu');
+  modelPromise = (async () => {
+    try {
+      // Set up TensorFlow.js for React Native
+    await tf.ready();
+    // Try webgl backend first - it's much faster than cpu on mobile
+    try {
+      await tf.setBackend('webgl');
+    } catch {
+      try {
+        await tf.setBackend('cpu');
+      } catch (cpuError) {
+        console.warn('Both webgl and cpu backends failed, using default');
+      }
+    }
     model = await cocoSsd.load({
       base: 'lite_mobilenet_v2' // Faster variant
     });
@@ -28,18 +37,51 @@ export async function loadModel() {
     return model;
   } catch (error) {
     console.error('Error loading model:', error);
+    throw error;
+  } finally {
+    modelLoading = false;
+    if (model && modelPromise) {
+      // keep the modelPromise resolved for future calls
+    } else {
+      modelPromise = null;
+    }
+  }
+})();
+
+  try {
+    return await modelPromise;
+  } catch (error) {
+    // If load failed, clear model variables so retries can run
+    model = null;
+    modelPromise = null;
     modelLoading = false;
     throw error;
   }
 }
 
-export async function detectObjects(imageElement) {
+export async function detectObjects(imageUri) {
   if (!model) {
     await loadModel();
   }
 
   try {
-    const predictions = await model.detect(imageElement);
+    // Fetch the image as binary
+    const response = await fetch(imageUri);
+    if (!response.ok) {
+      throw new Error(`Image load failed: ${response.status} ${response.statusText}`);
+    }
+    const imageData = await response.arrayBuffer();
+    const imageBytes = new Uint8Array(imageData);
+
+    // Decode JPEG to tensor [height, width, 3]
+    const imageTensor = decodeJpeg(imageBytes, 3);
+
+    // Run detection
+    const predictions = await model.detect(imageTensor);
+
+    // Clean up tensor to prevent memory leaks
+    imageTensor.dispose();
+
     return predictions.map(pred => ({
       class: pred.class,
       score: pred.score,

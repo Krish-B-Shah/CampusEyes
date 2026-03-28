@@ -8,7 +8,7 @@ import {
   Dimensions,
   Platform
 } from 'react-native';
-import { Camera } from 'expo-camera';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
 import { LOCATIONS, DETECTION_OBJECTS } from '../constants/locations';
 import {
@@ -18,15 +18,14 @@ import {
 import {
   speak,
   stopSpeaking,
-  formatDetectionSpeech,
-  formatPositionSpeech
+  formatDetectionSpeech
 } from '../services/speechService';
 import { loadModel, detectObjects, filterRelevantObjects } from '../services/detectionService';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 export default function MobileModeScreen() {
-  const [hasPermission, setHasPermission] = useState(null);
+  const [hasPermission, requestCameraPermission] = useCameraPermissions();
   const [hasLocationPermission, setHasLocationPermission] = useState(null);
   const [isDetecting, setIsDetecting] = useState(false);
   const [detections, setDetections] = useState([]);
@@ -35,9 +34,9 @@ export default function MobileModeScreen() {
   const [navigationInfo, setNavigationInfo] = useState(null);
   const [modelLoaded, setModelLoaded] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
+  const [errorMessage, setErrorMessage] = useState(null);
 
   const cameraRef = useRef(null);
-  const lastDetectionTime = useRef(0);
   const lastNavigationTime = useRef(0);
   const lastLocationTime = useRef(0);
   const detectionInterval = useRef(null);
@@ -46,20 +45,13 @@ export default function MobileModeScreen() {
   // Request permissions
   useEffect(() => {
     (async () => {
-      const { status: cameraStatus } = await Camera.requestCameraPermissionsAsync();
-      setHasPermission(cameraStatus === 'granted');
+      if (hasPermission === null) {
+        await requestCameraPermission();
+      }
 
       const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
       setHasLocationPermission(locationStatus === 'granted');
 
-      if (cameraStatus === 'granted') {
-        try {
-          await loadModel();
-          setModelLoaded(true);
-        } catch (error) {
-          console.log('Model loading error:', error);
-        }
-      }
     })();
   }, []);
 
@@ -70,32 +62,42 @@ export default function MobileModeScreen() {
     let active = true;
 
     const subscribeToLocation = async () => {
-      const location = await Location.getCurrentPositionAsync({});
-      if (active) {
-        setCurrentLocation({
-          latitude: location.coords.latitude,
-          longitude: location.coords.longitude,
-          heading: location.coords.heading || 0
+      try {
+        const location = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.High,
+          timeout: 15000,
+          maximumAge: 1000
         });
 
-        locationSubscription.current = await Location.watchPositionAsync(
-          {
-            accuracy: Location.Accuracy.High,
-            timeInterval: 1000,
-            distanceInterval: 1
-          },
-          (locationUpdate) => {
-            const now = Date.now();
-            if (now - lastLocationTime.current > 1000) {
-              lastLocationTime.current = now;
-              setCurrentLocation({
-                latitude: locationUpdate.coords.latitude,
-                longitude: locationUpdate.coords.longitude,
-                heading: locationUpdate.coords.heading || 0
-              });
+        if (active) {
+          setCurrentLocation({
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+            heading: location.coords.heading || 0
+          });
+
+          locationSubscription.current = await Location.watchPositionAsync(
+            {
+              accuracy: Location.Accuracy.High,
+              timeInterval: 1000,
+              distanceInterval: 1
+            },
+            (locationUpdate) => {
+              const now = Date.now();
+              if (now - lastLocationTime.current > 1000) {
+                lastLocationTime.current = now;
+                setCurrentLocation({
+                  latitude: locationUpdate.coords.latitude,
+                  longitude: locationUpdate.coords.longitude,
+                  heading: locationUpdate.coords.heading || 0
+                });
+              }
             }
-          }
-        );
+          );
+        }
+      } catch (error) {
+        console.warn('Location access error:', error);
+        setErrorMessage('Location unavailable: ' + (error.message || 'Timed out')); 
       }
     };
 
@@ -126,34 +128,6 @@ export default function MobileModeScreen() {
     }
   }, [currentLocation, selectedDestination]);
 
-  // Process camera frames
-  const processFrame = useCallback(async (imageAsset) => {
-    if (!modelLoaded || !imageAsset) return;
-
-    const now = Date.now();
-    if (now - lastDetectionTime.current < 1500) return;
-    lastDetectionTime.current = now;
-
-    try {
-      // Create an image element for detection
-      const imageUri = imageAsset.uri;
-
-      // For React Native, we need to use the camera's takePictureAsync
-      // and then process it. The actual detection will be simplified.
-      setDetections(prev => {
-        if (prev.length > 0) {
-          const speech = formatDetectionSpeech(prev);
-          if (speech) {
-            speak(speech);
-          }
-        }
-        return prev;
-      });
-    } catch (error) {
-      console.log('Frame processing error:', error);
-    }
-  }, [modelLoaded]);
-
   // Start/stop detection
   const toggleDetection = async () => {
     if (isDetecting) {
@@ -164,10 +138,21 @@ export default function MobileModeScreen() {
   };
 
   const startDetection = async () => {
+    // Load model if not already loaded
     if (!modelLoaded) {
-      speak('Model not ready. Please wait.');
-      return;
+      speak('Loading detection model. Please wait.');
+      setErrorMessage(null);
+      try {
+        await loadModel();
+        setModelLoaded(true);
+      } catch (error) {
+        console.log('Model loading error:', error);
+        setErrorMessage('Model load failed; object detection unavailable. Use Simulate Demo.');
+        speak('Model failed to load. Use simulate demo instead.');
+        return;
+      }
     }
+
     setIsDetecting(true);
     speak('Detection started');
 
@@ -179,8 +164,17 @@ export default function MobileModeScreen() {
             base64: false,
             skipProcessing: true
           });
-          // In a real implementation, we'd process this image
-          // For now, we simulate detection results
+          if (image && image.uri) {
+            const results = await detectObjects(image.uri);
+            if (results.length > 0) {
+              const filtered = filterRelevantObjects(results, DETECTION_OBJECTS);
+              if (filtered.length > 0) {
+                setDetections(filtered);
+                const speech = formatDetectionSpeech(filtered);
+                if (speech) speak(speech);
+              }
+            }
+          }
         } catch (error) {
           console.log('Capture error:', error);
         }
@@ -209,7 +203,7 @@ export default function MobileModeScreen() {
     speak(speech);
   };
 
-  if (hasPermission === null || hasLocationPermission === null) {
+  if (hasPermission === null) {
     return (
       <View style={styles.container}>
         <Text style={styles.statusText}>Requesting permissions...</Text>
@@ -217,10 +211,10 @@ export default function MobileModeScreen() {
     );
   }
 
-  if (hasPermission === false) {
+  if (!hasPermission?.granted || hasLocationPermission === null) {
     return (
       <View style={styles.container}>
-        <Text style={styles.statusText}>Camera permission required</Text>
+        <Text style={styles.statusText}>Camera and location permissions required</Text>
       </View>
     );
   }
@@ -229,10 +223,10 @@ export default function MobileModeScreen() {
     <View style={styles.container}>
       {/* Camera View */}
       <View style={styles.cameraContainer}>
-        <Camera
+        <CameraView
           ref={cameraRef}
           style={styles.camera}
-          type={Camera.Constants.Type.back}
+          facing="back"
           onCameraReady={() => setCameraReady(true)}
           ratio="16:9"
         />
@@ -259,6 +253,13 @@ export default function MobileModeScreen() {
           Detection: {isDetecting ? 'ON' : 'OFF'}
         </Text>
       </View>
+
+      {/* Error message */}
+      {errorMessage && (
+        <View style={styles.errorInfo}>
+          <Text style={styles.errorText}>{errorMessage}</Text>
+        </View>
+      )}
 
       {/* Navigation Info */}
       {navigationInfo && (
@@ -431,5 +432,17 @@ const styles = StyleSheet.create({
     fontSize: 16,
     textAlign: 'center',
     marginTop: 50
+  },
+  errorInfo: {
+    padding: 10,
+    backgroundColor: 'rgba(255, 0, 0, 0.2)',
+    marginHorizontal: 20,
+    borderRadius: 8,
+    marginTop: 10
+  },
+  errorText: {
+    color: '#fff',
+    fontSize: 13,
+    textAlign: 'center'
   }
 });
