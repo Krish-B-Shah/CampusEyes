@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm view:*)"
+      "Bash(npm view:*)",
+      "Bash(curl -s \"https://api.openrouteservice.org/v2/directions/foot-walking?api_key=eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjE3ODQ4ZTdmNDJkNjQxMDk5MzM0ZmUyMDRhNWIyYzAzIiwiaCI6Im11cm11cjY0In0=&start=-82.41388,28.05872&end=-82.41420,28.05940\" -H \"Accept: application/json\")",
+      "Bash(curl -s \"https://api.openrouteservice.org/v2/directions/foot-walking?api_key=eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjE3ODQ4ZTdmNDJkNjQxMDk5MzM0ZmUyMDRhNWIyYzAzIiwiaCI6Im11cm11cjY0In0=&start=-82.41388,28.05872&end=-82.41420,28.05940\" -H \"Accept: application/geo+json\")"
     ]
   }
 }

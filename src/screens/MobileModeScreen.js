@@ -8,9 +8,10 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { WebView } from 'react-native-webview';
 import * as Location from 'expo-location';
 import { analyzeScene } from '../services/detectionService';
+import { startObstacleMonitor, stopObstacleMonitor, clearObstacleMemory, setObstacleContextRefs } from '../services/obstacleService';
 import { speak, stopSpeaking } from '../services/speechService';
 import { listenOnce } from '../services/voiceService';
-import { calculateNavigation, fetchRoute, speakNavigationStep, getLocationById } from '../services/navigationService';
+import { calculateNavigation, fetchRouteWithFallback, speakNavigationStep, speakUpcomingStep, getLocationById, getDistanceFromRoute } from '../services/navigationService';
 import { saveLocationMemory, getLocationMemory, formatMemoryContext } from '../services/memoryService';
 import { getNearbyHazards, subscribeToHazards } from '../services/hazardService';
 import { LOCATIONS } from '../constants/locations';
@@ -18,7 +19,7 @@ import { LOCATIONS } from '../constants/locations';
 const MAX_HISTORY_ENTRIES = 10;
 
 // ─── Map HTML — uses real route geometry from OSRM ──────────────────────────
-const MAP_HTML = (userLat, userLng, routeCoords, dest, hazards) => {
+const MAP_HTML = (userLat, userLng, routeCoords, dest, hazards, isFallbackRoute) => {
   // routeCoords is [[lon, lat], ...] from OSRM
   const hasRoute = routeCoords && routeCoords.length >= 2;
   const routeJs = hasRoute
@@ -69,9 +70,9 @@ const MAP_HTML = (userLat, userLng, routeCoords, dest, hazards) => {
     L.marker([${dest.latitude}, ${dest.longitude}], { icon: destIcon }).addTo(map).bindPopup('${dest.name.replace(/'/g, "\\'")}');
     ` : ''}
 
+    var fallbackLine;
     ${hasRoute ? `
     const routeCoords = ${routeJs};
-    // Convert [lon, lat] to [lat, lon] for Leaflet
     const latlngs = routeCoords.map(c => [c[1], c[0]]);
     const routeLine = L.polyline(latlngs, {
       color: '#3b82f6',
@@ -81,6 +82,20 @@ const MAP_HTML = (userLat, userLng, routeCoords, dest, hazards) => {
       lineJoin: 'round',
     }).addTo(map);
     map.fitBounds(routeLine.getBounds(), { padding: [50, 50], maxZoom: 18 });
+    ` : ''}
+    ${!hasRoute && dest ? `
+    fallbackLine = L.polyline([
+      [${userLat}, ${userLng}],
+      [${dest.latitude}, ${dest.longitude}]
+    ], {
+      color: '#f59e0b',
+      weight: 5,
+      opacity: 0.7,
+      dashArray: '12, 10',
+      lineCap: 'round',
+      lineJoin: 'round',
+    }).addTo(map);
+    map.fitBounds(fallbackLine.getBounds(), { padding: [50, 50], maxZoom: 18 });
     ` : ''}
 
     ${hazards.map(h => `
@@ -94,13 +109,20 @@ const MAP_HTML = (userLat, userLng, routeCoords, dest, hazards) => {
 };
 
 // Update user position on map
-const MAP_UPDATE_JS = (lat, lng, routeCoords, dest) => `
+const MAP_UPDATE_JS = (lat, lng, routeCoords, dest, isFallbackRoute) => `
   if (typeof userMarker !== 'undefined') {
     userMarker.setLatLng([${lat}, ${lng}]);
   }
   if (typeof routeLine !== 'undefined' && routeCoords && routeCoords.length >= 2) {
     var latlngs = routeCoords.map(function(c) { return [c[1], c[0]]; });
     routeLine.setLatLngs(latlngs);
+  }
+  if (typeof fallbackLine !== 'undefined' && ${isFallbackRoute}) {
+    var latlngs = fallbackLine.getLatLngs();
+    if (latlngs.length >= 2) {
+      latlngs[0] = [${lat}, ${lng}];
+      fallbackLine.setLatLngs(latlngs);
+    }
   }
 `;
 
@@ -139,11 +161,21 @@ export default function MobileModeScreen() {
   const selectedDestRef = useRef(selectedDestination);
   const currentLocationRef = useRef(null);
   const routeDataIntervalRef = useRef(null);
+  const lastRerouteTimeRef = useRef(null);
 
   useEffect(() => { currentModeRef.current = currentMode; }, [currentMode]);
   useEffect(() => { lastResponseRef.current = lastResponse; }, [lastResponse]);
   useEffect(() => { selectedDestRef.current = selectedDestination; }, [selectedDestination]);
   useEffect(() => { currentLocationRef.current = currentLocation; }, [currentLocation]);
+
+  // Keep obstacle context refs in sync as state changes
+  useEffect(() => {
+    setObstacleContextRefs({
+      getMemoryContext: () => memoryContext,
+      getCommunityHazards: () => communityHazards,
+      getDestination: () => selectedDestRef.current ? getLocationById(selectedDestRef.current)?.name : null,
+    });
+  }, [memoryContext, communityHazards, selectedDestination]);
 
   // ─── PERMISSIONS ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -152,6 +184,7 @@ export default function MobileModeScreen() {
     return () => {
       if (navIntervalRef.current) clearInterval(navIntervalRef.current);
       if (hazardUnsubRef.current) hazardUnsubRef.current();
+      stopObstacleMonitor();
     };
   }, []);
 
@@ -166,12 +199,16 @@ export default function MobileModeScreen() {
     const loc = currentLocation;
     if (!dest || !loc) return;
 
-    const route = await fetchRoute(
+    const route = await fetchRouteWithFallback(
       loc.latitude, loc.longitude,
       dest.latitude, dest.longitude
     );
     setRouteData(route);
     setMapKey(k => k + 1);
+
+    if (route.provider === 'straight') {
+      speak('Route service unavailable. Showing direct path to destination.', true);
+    }
   }, [currentLocation]);
 
   const startLocationTracking = async () => {
@@ -184,7 +221,8 @@ export default function MobileModeScreen() {
         if (webViewRef.current) {
           const dest = selectedDestRef.current ? getLocationById(selectedDestRef.current) : null;
           const rc = routeDataRef.current?.geometry;
-          webViewRef.current.injectJavaScript(MAP_UPDATE_JS(coords.latitude, coords.longitude, rc, dest));
+          const isFallback = routeDataRef.current?.provider === 'straight';
+          webViewRef.current.injectJavaScript(MAP_UPDATE_JS(coords.latitude, coords.longitude, rc, dest, isFallback));
         }
 
         if (!firstLocationRef.current) {
@@ -202,6 +240,20 @@ export default function MobileModeScreen() {
               speak(`Warning — ${newHazard.description} reported nearby.`, true);
             }
           );
+
+          // Wire up live context so obstacle scans always use current state
+          setObstacleContextRefs({
+            getMemoryContext: () => memoryContext,
+            getCommunityHazards: () => communityHazards,
+            getDestination: () => selectedDestRef.current ? getLocationById(selectedDestRef.current)?.name : null,
+          });
+
+          // Start obstacle monitoring after first location
+          startObstacleMonitor(cameraRef, {
+            onObstacles: (obstacles, announcement) => {
+              if (announcement) speak(announcement, true);
+            },
+          });
         }
       }
     );
@@ -226,9 +278,40 @@ export default function MobileModeScreen() {
         const loc = currentLocationRef.current;
         if (!dest || !loc) return;
 
-        const info = speakNavigationStep(routeDataRef.current, loc.latitude, loc.longitude);
-        if (info) {
-          setNavigationInfo(info);
+        const route = routeDataRef.current;
+
+        // Off-route detection
+        if (route && route.provider !== 'straight') {
+          const offRouteDist = getDistanceFromRoute(loc, route);
+          const now = Date.now();
+          if (offRouteDist > NAVIGATION_CONFIG.offRouteThreshold) {
+            if (!lastRerouteTimeRef.current || (now - lastRerouteTimeRef.current > NAVIGATION_CONFIG.rerouteCooldownMs)) {
+              lastRerouteTimeRef.current = now;
+              speak('You seem to have gone off the planned route. Recalculating.', true);
+              loadRoute(selectedDestination);
+              return;
+            }
+          }
+        }
+
+        // Voice guidance — always runs
+        if (route?.steps?.length) {
+          const info = speakNavigationStep(route, loc.latitude, loc.longitude);
+          if (info) setNavigationInfo(info);
+
+          // Look-ahead turn announcement
+          const upcoming = speakUpcomingStep(route, loc.latitude, loc.longitude);
+          if (upcoming) speak(upcoming);
+        } else {
+          // Fallback: bearing-based guidance
+          const nav = calculateNavigation(loc, dest);
+          if (nav) {
+            setNavigationInfo({
+              instruction: nav.instruction,
+              distanceMeters: nav.distanceMeters,
+              hasArrived: nav.hasArrived,
+            });
+          }
         }
       }, 3000);
     } else {
@@ -415,7 +498,8 @@ export default function MobileModeScreen() {
   const mapLat = currentLocation?.latitude ?? 28.0605;
   const mapLng = currentLocation?.longitude ?? -82.4135;
   const routeCoords = routeData?.geometry ?? null;
-  const mapHtml = MAP_HTML(mapLat, mapLng, routeCoords, dest, communityHazards);
+  const isFallback = routeData?.provider === 'straight';
+  const mapHtml = MAP_HTML(mapLat, mapLng, routeCoords, dest, communityHazards, isFallback);
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -464,7 +548,10 @@ export default function MobileModeScreen() {
 
         {/* Nav instruction */}
         {navigationInfo && (
-          <View style={styles.navOverlay}>
+          <View style={[styles.navOverlay, isFallback && styles.navOverlayFallback]}>
+            {isFallback && (
+              <Text style={styles.navOverlayFallbackBadge}>DIRECT</Text>
+            )}
             <Text style={styles.navOverlayText} numberOfLines={2}>
               {navigationInfo.instruction}
             </Text>
@@ -632,6 +719,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(29, 78, 216, 0.92)', borderRadius: 14,
     padding: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
   },
+  navOverlayFallback: { backgroundColor: 'rgba(180, 120, 0, 0.92)' },
+  navOverlayFallbackBadge: { color: '#fde68a', fontSize: 10, fontWeight: 'bold', marginBottom: 4 },
   navOverlayText: { color: '#fff', fontSize: 14, fontWeight: '500', flex: 1, marginRight: 10 },
   navOverlayDist: { color: '#bfdbfe', fontSize: 20, fontWeight: 'bold' },
   mapDestButton: {

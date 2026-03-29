@@ -54,4 +54,7 @@ export const NAVIGATION_CONFIG = {
   arrivalThreshold: 15,
   straightThreshold: 25,
   nearThreshold: 50,
+  offRouteThreshold: 40,
+  rerouteCooldownMs: 10000,
+  lookAheadDistance: 30,
 };
