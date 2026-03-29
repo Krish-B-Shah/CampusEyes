@@ -50,8 +50,14 @@
           "locationWhenInUsePermission": "CampusEyes needs location access for navigation"
         }
       ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "CampusEyes needs microphone access for voice commands"
+        }
+      ],
       "expo-font",
-      "expo-audio"
+      "expo-asset"
     ]
   }
 }

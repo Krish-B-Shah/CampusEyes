@@ -1,28 +1,25 @@
-import { Audio } from 'expo-audio';
+import { Audio } from 'expo-av';
 import { transcribeAudio } from './sttService';
 
-// ─── STT Cooldown — prevents burning through Gemini quota ──────────────────
+// ─── Cooldown — prevents Gemini quota exhaustion ─────────────────────────────
 const STT_COOLDOWN_MS = 3000;
 let lastSttTime = 0;
 
-// ─── Command vocabulary ───────────────────────────────────────────────────
+// ─── Command vocabulary ──────────────────────────────────────────────────────
 
 const COMMAND_PATTERNS = {
-  navigate: [/navigate|navigation|nav/i, /go to navigate/i],
-  read: [/read|reading/i, /go to read/i],
-  identify: [/identify|what is that|what's that/i, /go to identify/i, /go to id/i],
-  scan: [/scan|look|analyze|what do you see/i, /look at this/i],
+  navigate: [/navigate|navigation|nav/i],
+  read: [/read|reading/i],
+  identify: [/identify|what is that|what's that|go to id/i],
+  scan: [/scan|look|analyze|what do you see|look at this/i],
   repeat: [/repeat|say again|what did you say|where am i|what's around/i],
-  help: [/help|commands|what can i say/i, /list commands/i],
+  help: [/help|commands|what can i say|list commands/i],
   panic: [/i.?m lost|i am lost|help me|emergency|panic/i],
   stop: [/stop|cancel|quiet|shut up/i],
 };
 
-/**
- * Parses transcribed text into a command object.
- * @param {string} text
- * @returns {{ command: string|null, args: string[] }}
- */
+// ─── Parse transcribed text into a command ─────────────────────────────────
+
 export const parseCommand = (text) => {
   if (!text) return { command: null, args: [] };
 
@@ -36,10 +33,10 @@ export const parseCommand = (text) => {
     }
   }
 
-  return { command: 'destination', args: [lower] };
+  return { command: null, args: [lower] };
 };
 
-// ─── Permission ────────────────────────────────────────────────────────────
+// ─── Permission ─────────────────────────────────────────────────────────────
 
 export const requestMicPermission = async () => {
   const { status } = await Audio.requestPermissionsAsync();
@@ -51,16 +48,13 @@ export const requestMicPermission = async () => {
 let recording = null;
 let isRecordingActive = false;
 
-/**
- * Full listen cycle: record → transcribe → parse → call onCommand.
- * Includes a 3-second cooldown to prevent Gemini quota exhaustion.
- * @param {function} onCommand - called with { command, args }
- * @param {function} onListening - called with boolean (listening state)
- */
+export const getIsRecording = () => isRecordingActive;
+
+// ─── Full listen cycle ─────────────────────────────────────────────────────
+
 export const listenOnce = async (onCommand, onListening) => {
   if (isRecordingActive) return;
 
-  // Cooldown guard — prevents STT spam
   const now = Date.now();
   if (now - lastSttTime < STT_COOLDOWN_MS) {
     onCommand({ command: 'error', args: ['please wait a moment before speaking again'] });
@@ -73,9 +67,10 @@ export const listenOnce = async (onCommand, onListening) => {
     return;
   }
 
-  try {
-    onListening(true);
+  isRecordingActive = true;
+  onListening(true);
 
+  try {
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
@@ -84,36 +79,46 @@ export const listenOnce = async (onCommand, onListening) => {
     const { recording: rec } = await Audio.Recording.createAsync(
       Audio.RecordingOptionsPresets.HIGH_QUALITY
     );
-
     recording = rec;
-    isRecordingActive = true;
 
-    // Record for up to 5 seconds
+    // Fixed 5-second window
     await new Promise(resolve => setTimeout(resolve, 5000));
 
     await rec.stopAndUnloadAsync();
-    isRecordingActive = false;
     await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+    isRecordingActive = false;
 
     const uri = rec.getURI();
     if (!uri) {
       onListening(false);
+      onCommand({ command: 'error', args: ['no audio recorded'] });
       return;
     }
 
     lastSttTime = Date.now();
-    const text = await transcribeAudio(uri);
+    const { text, error } = await transcribeAudio(uri);
     onListening(false);
 
-    if (text) {
-      const parsed = parseCommand(text);
-      onCommand(parsed);
+    if (error) {
+      onCommand({ command: 'error', args: [error] });
+      return;
     }
+
+    if (!text) {
+      onCommand({ command: 'error', args: ['did not catch that — please try again'] });
+      return;
+    }
+
+    const parsed = parseCommand(text);
+    onCommand(parsed);
+
   } catch (err) {
     isRecordingActive = false;
     onListening(false);
+    try {
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+    } catch (_) {}
     console.error('listenOnce error:', err);
+    onCommand({ command: 'error', args: ['voice recognition failed'] });
   }
 };
-
-export const getIsRecording = () => isRecordingActive;
