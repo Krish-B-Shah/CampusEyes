@@ -1,163 +1,150 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, ScrollView,
-  StyleSheet, SafeAreaView, Alert
+  StyleSheet, SafeAreaView
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
-import { LOCATIONS } from '../constants/locations';
-import {
-  calculateNavigation,
-  getLocationById,
-  buildWalkGraph,
-  getRouteSteps
-} from '../services/navigationService';
-import USF_MAP from '../../assets/USF_Map.json';
-import {
-  speak,
-  stopSpeaking
-} from '../services/speechService';
 import { analyzeScene } from '../services/detectionService';
 import { speak, stopSpeaking } from '../services/speechService';
+import { listenOnce } from '../services/voiceService';
 import { calculateNavigation, getLocationById } from '../services/navigationService';
 import { LOCATIONS } from '../constants/locations';
 
 const MODES = ['navigate', 'read', 'identify'];
-const MODE_LABELS = { navigate: '🧭 Navigate', read: '📖 Read', identify: '🔍 Identify' };
+const MODE_ICONS  = { navigate: '🧭', read: '📖', identify: '🔍' };
+const MODE_LABELS = { navigate: 'NAVIGATE', read: 'READ', identify: 'IDENTIFY' };
+
+const COMMANDS_HELP = `Available commands: Say "navigate" to switch to navigation mode. Say "read" to read text. Say "identify" to identify objects. Say "scan" to analyze your surroundings. Say "where am I" to repeat the last result. Say "help" to hear commands again.`;
 
 export default function MobileModeScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [locationPermission, setLocationPermission] = useState(false);
   const [currentLocation, setCurrentLocation] = useState(null);
-  const [navigationInfo, setNavigationInfo] = useState(null);
-  const [routeSteps, setRouteSteps] = useState([]);
-  const [routeStepIndex, setRouteStepIndex] = useState(0);
-  const [destinationLocation, setDestinationLocation] = useState(null);
-  const [modelLoaded, setModelLoaded] = useState(false);
-  const [cameraReady, setCameraReady] = useState(false);
-  const [errorMessage, setErrorMessage] = useState(null);
+  const [selectedDestination, setSelectedDestination] = useState(null);
   const [currentMode, setCurrentMode] = useState('navigate');
   const [isScanning, setIsScanning] = useState(false);
-  const [lastResponse, setLastResponse] = useState('');
+  const [lastResponse, setLastResponse] = useState('Tap the microphone and say a command — like "scan" or "navigate"');
   const [conversationHistory, setConversationHistory] = useState([]);
-  const [lastImageBase64, setLastImageBase64] = useState(null);
   const [memoryContext, setMemoryContext] = useState(null);
   const [communityHazards, setCommunityHazards] = useState([]);
   const [navigationInfo, setNavigationInfo] = useState(null);
   const [isListening, setIsListening] = useState(false);
+  const [lastHeard, setLastHeard] = useState('');
 
   const cameraRef = useRef(null);
   const navIntervalRef = useRef(null);
 
-  // Build walk graph from campus GeoJSON
-  useEffect(() => {
-    try {
-      buildWalkGraph(USF_MAP);
-    } catch (err) {
-      console.warn('Failed to build map graph:', err);
-    }
-  }, []);
-
-  // Request permissions
+  // ─── PERMISSIONS ──────────────────────────────────────────────────────────
   useEffect(() => {
     requestCameraPermission();
     requestLocationPermission();
   }, []);
 
-  // Get location updates
+  const requestLocationPermission = async () => {
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status === 'granted') {
+      setLocationPermission(true);
+      startLocationTracking();
+    }
+  };
+
+  const startLocationTracking = async () => {
+    await Location.watchPositionAsync(
+      { accuracy: Location.Accuracy.High, timeInterval: 1000, distanceInterval: 2 },
+      (loc) => setCurrentLocation(loc.coords)
+    );
+  };
+
+  // ─── ANNOUNCE MODE ON CHANGE ───────────────────────────────────────────────
   useEffect(() => {
-    if (!hasLocationPermission) return;
+    speak(`Now in ${currentMode} mode. Say "scan" to analyze.`);
+  }, [currentMode]);
 
-    let active = true;
-
-    const subscribeToLocation = async () => {
-      try {
-        const location = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.High,
-          timeout: 15000,
-          maximumAge: 1000
-        });
-
-        if (active) {
-          setCurrentLocation({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-            heading: location.coords.heading || 0
-          });
-
-          locationSubscription.current = await Location.watchPositionAsync(
-            {
-              accuracy: Location.Accuracy.High,
-              timeInterval: 1000,
-              distanceInterval: 1
-            },
-            (locationUpdate) => {
-              const now = Date.now();
-              if (now - lastLocationTime.current > 1000) {
-                lastLocationTime.current = now;
-                setCurrentLocation({
-                  latitude: locationUpdate.coords.latitude,
-                  longitude: locationUpdate.coords.longitude,
-                  heading: locationUpdate.coords.heading || 0
-                });
-              }
-            }
-          );
-        }
-      } catch (error) {
-        console.warn('Location access error:', error);
-        setErrorMessage('Location unavailable: ' + (error.message || 'Timed out'));
-      }
-    };
-
-    subscribeToLocation();
-
-    return () => {
-      active = false;
-      if (locationSubscription.current) {
-        locationSubscription.current.remove();
-      }
-    };
-  }, [hasLocationPermission]);
-
-  // Update navigation info and path instructions
+  // ─── NAVIGATION UPDATES ────────────────────────────────────────────────────
   useEffect(() => {
-    if (!currentLocation || !selectedDestination) return;
-
-    const destination = getLocationById(selectedDestination);
-    if (!destination) return;
-
-    setDestinationLocation(destination);
-
-    const nav = calculateNavigation(currentLocation, destination);
-    setNavigationInfo(nav);
-
-    // Recompute path steps from current location to destination
-    const steps = getRouteSteps(currentLocation, {
-      latitude: destination.latitude,
-      longitude: destination.longitude,
-      name: destination.name
-    });
-    setRouteSteps(steps);
-    setRouteStepIndex(0);
-
-    const now = Date.now();
-    if (now - lastNavigationTime.current > 3000) {
-      lastNavigationTime.current = now;
-      speak(nav.instruction);
+    if (navIntervalRef.current) clearInterval(navIntervalRef.current);
+    if (currentLocation && selectedDestination) {
+      navIntervalRef.current = setInterval(() => {
+        const dest = getLocationById(selectedDestination);
+        if (!dest) return;
+        const info = calculateNavigation(currentLocation, dest);
+        setNavigationInfo(info);
+        if (info) speak(info.instruction);
+      }, 4000);
     }
     return () => clearInterval(navIntervalRef.current);
   }, [currentLocation, selectedDestination]);
 
-  useEffect(() => {
-    if (routeSteps.length === 0) return;
-    const current = routeSteps[Math.min(routeStepIndex, routeSteps.length - 1)];
-    if (!current) return;
-    speak(current.text);
-  }, [routeSteps, routeStepIndex]);
+  // ─── VOICE COMMAND HANDLER ─────────────────────────────────────────────────
+  const handleVoiceCommand = useCallback(({ command, args }) => {
+    switch (command) {
+      case 'navigate':
+        setCurrentMode('navigate');
+        speak('Switched to navigate mode.');
+        break;
+      case 'read':
+        setCurrentMode('read');
+        speak('Switched to read mode.');
+        break;
+      case 'identify':
+        setCurrentMode('identify');
+        speak('Switched to identify mode.');
+        break;
+      case 'scan':
+        handleScan();
+        break;
+      case 'repeat':
+        if (lastResponse) speak(lastResponse, true);
+        else speak('No previous result to repeat. Say "scan" first.');
+        break;
+      case 'help':
+        speak(COMMANDS_HELP, true);
+        break;
+      case 'panic':
+        handlePanic();
+        break;
+      case 'stop':
+        stopSpeaking();
+        break;
+      case 'destination': {
+        const heard = args[0] || '';
+        setLastHeard(heard);
+        const match = LOCATIONS.find(loc =>
+          heard.includes(loc.name.toLowerCase())
+        );
+        if (match) {
+          setSelectedDestination(match.id);
+          speak(`Navigating to ${match.name}.`);
+        } else {
+          speak(`Did not recognize a destination. Try tapping a location below.`);
+        }
+        break;
+      }
+      default:
+        if (command === 'error') {
+          speak('Microphone error. Please try again.');
+        }
+        break;
+    }
+  }, [currentMode, lastResponse, selectedDestination]);
 
-  const analyzeCurrentScene = async () => {
-    if (!cameraRef.current || !cameraReady) return;
+  // ─── VOICE TAP ────────────────────────────────────────────────────────────
+  const handleMicTap = async () => {
+    if (isListening) return;
+    setLastHeard('');
+    await listenOnce(
+      (cmd) => { handleVoiceCommand(cmd); },
+      (listening) => setIsListening(listening)
+    );
+  };
+
+  // ─── MAIN SCAN ─────────────────────────────────────────────────────────────
+  const handleScan = async () => {
+    if (!cameraRef.current || isScanning) return;
+    setIsScanning(true);
+    stopSpeaking();
+    speak('Scanning...');
 
     try {
       const photo = await cameraRef.current.takePictureAsync({
@@ -179,7 +166,6 @@ export default function MobileModeScreen() {
       setLastResponse(response);
       speak(response, true);
 
-      // Save to conversation history for follow-ups
       setConversationHistory(prev => [
         ...prev,
         {
@@ -194,46 +180,18 @@ export default function MobileModeScreen() {
 
     } catch (err) {
       console.error('Scan error:', err);
-      speak('Scan failed. Please try again.');
+      const msg = 'Scan failed. Please try again.';
+      setLastResponse(msg);
+      speak(msg);
     } finally {
       setIsScanning(false);
     }
   };
 
-  // --- VOICE FOLLOW-UP ---
-  // Person 2 will pass memoryContext and communityHazards as props/state
-  // This function handles text follow-ups (voice recognition can be added)
-  const handleFollowUp = async (question) => {
-    if (!lastResponse) {
-      speak('Please scan first before asking a question.');
-      return;
-    }
-
-    const response = await analyzeScene({
-      imageUri: null, // no new image needed
-      mode: 'followup',
-      conversationHistory,
-      memoryContext,
-      communityHazards,
-      destination: selectedDestination
-        ? getLocationById(selectedDestination)?.name
-        : null,
-      userQuestion: question,
-    });
-
-    setLastResponse(response);
-    speak(response, true);
-
-    setConversationHistory(prev => [
-      ...prev,
-      { role: 'user', parts: [{ text: question }] },
-      { role: 'model', parts: [{ text: response }] }
-    ]);
-  };
-
-  // --- PANIC BUTTON ---
+  // ─── PANIC BUTTON ──────────────────────────────────────────────────────────
   const handlePanic = async () => {
     if (!cameraRef.current) return;
+    stopSpeaking();
     speak('Locating you now. Please hold still.', true);
     setIsScanning(true);
 
@@ -260,52 +218,89 @@ export default function MobileModeScreen() {
     }
   };
 
-  // --- EXPOSE SETTERS FOR PERSON 2 INTEGRATION ---
-  // Person 2 will call these from their service layer:
-  // setMemoryContext(memoryString)
-  // setCommunityHazards(hazardsArray)
+  // ─── MODE SWITCH (tap) ─────────────────────────────────────────────────────
+  const handleModeTap = (mode) => {
+    if (isScanning) return;
+    setCurrentMode(mode);
+  };
 
-  if (!cameraPermission) return <View style={styles.container}><Text style={styles.text}>Requesting permissions...</Text></View>;
+  // ─── PERMISSION STATES ─────────────────────────────────────────────────────
+  if (!cameraPermission) return (
+    <View style={styles.container}>
+      <Text style={styles.permissionText}>Requesting permissions...</Text>
+    </View>
+  );
+
   if (!cameraPermission.granted) return (
     <View style={styles.container}>
-      <Text style={styles.text}>Camera access required for CampusEyes.</Text>
-      <TouchableOpacity style={styles.button} onPress={requestCameraPermission}>
-        <Text style={styles.buttonText}>Grant Camera Access</Text>
+      <Text style={styles.permissionText}>Camera access required for CampusEyes.</Text>
+      <TouchableOpacity style={styles.permissionButton} onPress={requestCameraPermission}>
+        <Text style={styles.permissionButtonText}>Grant Camera Access</Text>
       </TouchableOpacity>
     </View>
   );
 
+  // ─── RENDER ────────────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.container}>
 
-      {/* CAMERA */}
+      {/* ── TOP STATUS BAR ── */}
+      <View style={styles.statusBar}>
+        <View style={[styles.micIndicator, isListening && styles.micIndicatorActive]}>
+          <Text style={styles.micIcon}>🎙️</Text>
+          <Text style={styles.micLabel}>{isListening ? 'Listening...' : 'Ready'}</Text>
+        </View>
+
+        <View style={styles.modeBadge}>
+          <Text style={styles.modeBadgeText}>
+            {MODE_ICONS[currentMode]} {MODE_LABELS[currentMode]}
+          </Text>
+        </View>
+      </View>
+
+      {/* ── CAMERA ── */}
       <View style={styles.cameraContainer}>
         <CameraView ref={cameraRef} style={styles.camera} facing="back" />
       </View>
 
-      {/* MODE TOGGLE */}
+      {/* ── MODE CARDS ── */}
       <View style={styles.modeRow}>
         {MODES.map(mode => (
           <TouchableOpacity
             key={mode}
-            style={[styles.modeButton, currentMode === mode && styles.modeButtonActive]}
-            onPress={() => setCurrentMode(mode)}
+            style={[
+              styles.modeCard,
+              currentMode === mode && styles.modeCardActive,
+            ]}
+            onPress={() => handleModeTap(mode)}
+            accessibilityLabel={`${MODE_LABELS[mode]} mode`}
+            accessibilityHint={`Double tap to switch to ${MODE_LABELS[mode]} mode`}
+            accessibilityRole="button"
           >
-            <Text style={[styles.modeText, currentMode === mode && styles.modeTextActive]}>
+            <Text style={styles.modeCardIcon}>{MODE_ICONS[mode]}</Text>
+            <Text style={[
+              styles.modeCardLabel,
+              currentMode === mode && styles.modeCardLabelActive,
+            ]}>
               {MODE_LABELS[mode]}
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      {/* RESPONSE */}
-      <ScrollView style={styles.responseBox}>
-        <Text style={styles.responseText}>
-          {lastResponse || 'Tap Scan to analyze your surroundings.'}
-        </Text>
-      </ScrollView>
+      {/* ── RESPONSE BOX ── */}
+      <View style={styles.responseBox}>
+        <ScrollView contentContainerStyle={styles.responseScrollContent}>
+          <Text style={styles.responseText}>
+            {lastResponse || 'Say "scan" to analyze your surroundings.'}
+          </Text>
+        </ScrollView>
+        {lastHeard ? (
+          <Text style={styles.lastHeardText}>Heard: "{lastHeard}"</Text>
+        ) : null}
+      </View>
 
-      {/* NAVIGATION INFO */}
+      {/* ── NAVIGATION BANNER ── */}
       {navigationInfo && (
         <View style={styles.navBanner}>
           <Text style={styles.navText}>
@@ -314,7 +309,7 @@ export default function MobileModeScreen() {
         </View>
       )}
 
-      {/* COMMUNITY HAZARD BANNER */}
+      {/* ── COMMUNITY HAZARD BANNER ── */}
       {communityHazards.length > 0 && (
         <View style={styles.hazardBanner}>
           <Text style={styles.hazardText}>
@@ -323,30 +318,36 @@ export default function MobileModeScreen() {
         </View>
       )}
 
-      {/* MAIN SCAN BUTTON */}
+      {/* ── MIC BUTTON ── */}
       <TouchableOpacity
-        style={[styles.scanButton, isScanning && styles.scanButtonDisabled]}
-        onPress={handleScan}
+        style={[
+          styles.micButton,
+          isListening && styles.micButtonActive,
+          isScanning && styles.micButtonDisabled,
+        ]}
+        onPress={handleMicTap}
         disabled={isScanning}
-        accessibilityLabel="Scan surroundings"
+        accessibilityLabel="Tap to talk. Say a command like scan, navigate, read, identify, or help."
         accessibilityRole="button"
       >
-        <Text style={styles.scanButtonText}>
-          {isScanning ? 'Scanning...' : '👁️ SCAN'}
+        <Text style={styles.micButtonIcon}>🎤</Text>
+        <Text style={styles.micButtonText}>
+          {isListening ? 'Listening...' : isScanning ? 'Scanning...' : 'TAP TO TALK'}
         </Text>
       </TouchableOpacity>
 
-      {/* PANIC BUTTON */}
+      {/* ── PANIC BUTTON ── */}
       <TouchableOpacity
         style={styles.panicButton}
         onPress={handlePanic}
-        accessibilityLabel="I am lost, help me"
+        accessibilityLabel="I am lost. Tap to get help immediately."
+        accessibilityRole="button"
       >
-        <Text style={styles.panicText}>🆘 I'M LOST</Text>
+        <Text style={styles.panicText}>🆘  I'M LOST</Text>
       </TouchableOpacity>
 
-      {/* DESTINATION SELECTOR */}
-      <ScrollView horizontal style={styles.destinationRow}>
+      {/* ── DESTINATION SELECTOR ── */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.destinationRow}>
         {LOCATIONS.map(loc => (
           <TouchableOpacity
             key={loc.id}
@@ -358,6 +359,8 @@ export default function MobileModeScreen() {
               setSelectedDestination(loc.id);
               speak(`Navigating to ${loc.name}`);
             }}
+            accessibilityLabel={`Navigate to ${loc.name}`}
+            accessibilityRole="button"
           >
             <Text style={styles.destText}>{loc.name}</Text>
           </TouchableOpacity>
@@ -368,31 +371,164 @@ export default function MobileModeScreen() {
   );
 }
 
+// ─── STYLES ─────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
-  text: { color: '#fff', fontSize: 18, textAlign: 'center', margin: 20 },
-  cameraContainer: { flex: 1, maxHeight: 300 },
+  container: { flex: 1, backgroundColor: '#0a0a12' },
+
+  // Permission screens
+  permissionText: { color: '#fff', fontSize: 20, textAlign: 'center', marginTop: 60, paddingHorizontal: 20 },
+  permissionButton: { backgroundColor: '#2563eb', margin: 20, padding: 18, borderRadius: 14, alignItems: 'center' },
+  permissionButtonText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+
+  // Status bar
+  statusBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: '#111118',
+    borderBottomWidth: 1,
+    borderBottomColor: '#222',
+  },
+  micIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1a1a2a',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    borderWidth: 1.5,
+    borderColor: '#333',
+  },
+  micIndicatorActive: {
+    backgroundColor: '#1a1500',
+    borderColor: '#f59e0b',
+  },
+  micIcon: { fontSize: 16, marginRight: 6 },
+  micLabel: { color: '#aaa', fontSize: 13 },
+  modeBadge: {
+    backgroundColor: '#1d4ed8',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 20,
+  },
+  modeBadgeText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+
+  // Camera
+  cameraContainer: { width: '100%', height: 220 },
   camera: { flex: 1 },
-  modeRow: { flexDirection: 'row', justifyContent: 'space-around', padding: 8, backgroundColor: '#111' },
-  modeButton: { padding: 8, borderRadius: 8, backgroundColor: '#222' },
-  modeButtonActive: { backgroundColor: '#2563eb' },
-  modeText: { color: '#aaa', fontSize: 13 },
-  modeTextActive: { color: '#fff', fontWeight: 'bold' },
-  responseBox: { maxHeight: 120, backgroundColor: '#111', margin: 8, borderRadius: 8, padding: 10 },
-  responseText: { color: '#fff', fontSize: 15, lineHeight: 22 },
-  navBanner: { backgroundColor: '#1d4ed8', padding: 8, margin: 8, borderRadius: 8 },
-  navText: { color: '#fff', fontSize: 14, textAlign: 'center' },
-  hazardBanner: { backgroundColor: '#dc2626', padding: 8, margin: 8, borderRadius: 8 },
-  hazardText: { color: '#fff', fontSize: 14, textAlign: 'center' },
-  scanButton: { backgroundColor: '#2563eb', margin: 12, padding: 20, borderRadius: 16, alignItems: 'center' },
-  scanButtonDisabled: { backgroundColor: '#555' },
-  scanButtonText: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
-  panicButton: { backgroundColor: '#dc2626', margin: 12, marginTop: 0, padding: 14, borderRadius: 16, alignItems: 'center' },
-  panicText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  destinationRow: { paddingHorizontal: 8, paddingBottom: 8, maxHeight: 60 },
-  destButton: { backgroundColor: '#222', padding: 10, borderRadius: 8, marginRight: 8, minWidth: 100, alignItems: 'center' },
-  destButtonActive: { backgroundColor: '#065f46' },
-  destText: { color: '#fff', fontSize: 13 },
-  button: { backgroundColor: '#2563eb', padding: 16, margin: 20, borderRadius: 12, alignItems: 'center' },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+
+  // Mode cards
+  modeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    backgroundColor: '#111118',
+  },
+  modeCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1a1a28',
+    borderRadius: 16,
+    borderWidth: 2,
+    borderColor: '#2a2a3a',
+    width: 100,
+    height: 80,
+  },
+  modeCardActive: {
+    backgroundColor: '#1e3a5f',
+    borderColor: '#3b82f6',
+  },
+  modeCardIcon: { fontSize: 28, marginBottom: 4 },
+  modeCardLabel: { color: '#888', fontSize: 12, fontWeight: 'bold', letterSpacing: 1 },
+  modeCardLabelActive: { color: '#fff' },
+
+  // Response box — LARGE readable text
+  responseBox: {
+    flex: 1,
+    backgroundColor: '#111118',
+    marginHorizontal: 12,
+    marginTop: 10,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#222',
+    padding: 16,
+  },
+  responseScrollContent: { flexGrow: 1 },
+  responseText: {
+    color: '#fff',
+    fontSize: 24,       // Large text for accessibility + judges
+    lineHeight: 34,
+    fontWeight: '300',
+  },
+  lastHeardText: {
+    color: '#f59e0b',
+    fontSize: 13,
+    marginTop: 8,
+    fontStyle: 'italic',
+  },
+
+  // Nav banner
+  navBanner: { backgroundColor: '#1d4ed8', marginHorizontal: 12, marginTop: 8, padding: 10, borderRadius: 10 },
+  navText: { color: '#fff', fontSize: 15, textAlign: 'center', fontWeight: '500' },
+
+  // Hazard banner
+  hazardBanner: { backgroundColor: '#dc2626', marginHorizontal: 12, marginTop: 6, padding: 8, borderRadius: 10 },
+  hazardText: { color: '#fff', fontSize: 14, textAlign: 'center', fontWeight: '500' },
+
+  // Mic button — prominent and accessible
+  micButton: {
+    backgroundColor: '#1a1a2a',
+    marginHorizontal: 12,
+    marginTop: 10,
+    paddingVertical: 22,
+    borderRadius: 18,
+    borderWidth: 2.5,
+    borderColor: '#3b82f6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+  },
+  micButtonActive: {
+    backgroundColor: '#1a1500',
+    borderColor: '#f59e0b',
+  },
+  micButtonDisabled: {
+    backgroundColor: '#1a1a2a',
+    borderColor: '#444',
+  },
+  micButtonIcon: { fontSize: 28, marginRight: 10 },
+  micButtonText: { color: '#fff', fontSize: 22, fontWeight: 'bold', letterSpacing: 1 },
+
+  // Panic button
+  panicButton: {
+    backgroundColor: '#dc2626',
+    marginHorizontal: 12,
+    marginTop: 10,
+    paddingVertical: 16,
+    borderRadius: 16,
+    alignItems: 'center',
+  },
+  panicText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
+
+  // Destination row
+  destinationRow: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    maxHeight: 56,
+  },
+  destButton: {
+    backgroundColor: '#1a1a2a',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: '#2a2a3a',
+  },
+  destButtonActive: { backgroundColor: '#065f46', borderColor: '#10b981' },
+  destText: { color: '#ccc', fontSize: 13, fontWeight: '500' },
 });
