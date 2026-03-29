@@ -1,4 +1,4 @@
-import * as FileSystem from 'expo-file-system';
+import { readAsStringAsync } from 'expo-file-system';
 
 // For Expo, environment variables must be prefixed with EXPO_PUBLIC_
 // and are then available via process.env.EXPO_PUBLIC_GEMINI_API_KEY
@@ -33,8 +33,8 @@ export const analyzeScene = async ({
 }) => {
   try {
     // Convert image to base64
-    const base64 = await FileSystem.readAsStringAsync(imageUri, {
-      encoding: FileSystem.EncodingType.Base64,
+    const base64 = await readAsStringAsync(imageUri, {
+      encoding: 'base64',
     });
 
     // Build context string
