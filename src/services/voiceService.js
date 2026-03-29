@@ -1,16 +1,17 @@
-import { Audio } from 'expo-av';
+import { AudioModule, requestRecordingPermissionsAsync, setAudioModeAsync, RecordingPresets } from 'expo-audio';
 import { transcribeAudio } from './sttService';
 
 // ─── Cooldown — prevents Gemini quota exhaustion ─────────────────────────────
-const STT_COOLDOWN_MS = 3000;
+const STT_COOLDOWN_MS = 5000;
 let lastSttTime = 0;
 
 // ─── Command vocabulary ──────────────────────────────────────────────────────
 
 const COMMAND_PATTERNS = {
-  navigate: [/navigate|navigation|nav/i],
+  navigate: [/navigate|navigation|nav|route|go to|take me to|i want to go|find/i],
+  question: [/where is|where's|what is|what's|is there|can you see|do you see|locate|find the|show me|tell me|how far|which direction/i],
   read: [/read|reading/i],
-  identify: [/identify|what is that|what's that|go to id/i],
+  identify: [/identify|what is this/i],
   scan: [/scan|look|analyze|what do you see|look at this/i],
   repeat: [/repeat|say again|what did you say|where am i|what's around/i],
   help: [/help|commands|what can i say|list commands/i],
@@ -39,7 +40,7 @@ export const parseCommand = (text) => {
 // ─── Permission ─────────────────────────────────────────────────────────────
 
 export const requestMicPermission = async () => {
-  const { status } = await Audio.requestPermissionsAsync();
+  const { status } = await requestRecordingPermissionsAsync();
   return status === 'granted';
 };
 
@@ -71,24 +72,24 @@ export const listenOnce = async (onCommand, onListening) => {
   onListening(true);
 
   try {
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: true,
-      playsInSilentModeIOS: true,
+    await setAudioModeAsync({
+      allowsRecording: true,
+      playsInSilentMode: true,
     });
 
-    const { recording: rec } = await Audio.Recording.createAsync(
-      Audio.RecordingOptionsPresets.HIGH_QUALITY
-    );
+    const rec = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
     recording = rec;
+    await rec.prepareToRecordAsync();
+    rec.record();
 
     // Fixed 5-second window
     await new Promise(resolve => setTimeout(resolve, 5000));
 
-    await rec.stopAndUnloadAsync();
-    await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+    await rec.stop();
+    await setAudioModeAsync({ allowsRecording: false });
     isRecordingActive = false;
 
-    const uri = rec.getURI();
+    const uri = rec.uri;
     if (!uri) {
       onListening(false);
       onCommand({ command: 'error', args: ['no audio recorded'] });
@@ -116,7 +117,7 @@ export const listenOnce = async (onCommand, onListening) => {
     isRecordingActive = false;
     onListening(false);
     try {
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+      await setAudioModeAsync({ allowsRecording: false });
     } catch (_) {}
     console.error('listenOnce error:', err);
     onCommand({ command: 'error', args: ['voice recognition failed'] });

@@ -1,152 +1,33 @@
 import { analyzeScene } from './detectionService';
 
-// Tracks previously announced obstacles to avoid repetition
-const announcedObstacles = new Map(); // key → { lastDistance, lastAnnouncedAt, lastDescription }
-const SCAN_INTERVAL_MS = 12000;        // scan every 12 seconds
-const ANNOUNCEMENT_COOLDOWN_MS = 15000; // don't re-announce same obstacle within 15s
-const SIGNIFICANT_DISTANCE_CHANGE_FT = 10; // announce when distance changes by 10+ ft (closer spacing needed)
 
-// Parse distance from Gemini's response text (e.g., "5 feet", "10 ft", "3 meters")
-const parseDistance = (text) => {
-  const lower = text.toLowerCase();
-  // Match patterns like "5 feet", "10 ft", "3 meters", "3m"
-  const match = lower.match(/(\d+(?:\.\d+)?)\s*(?:feet|ft|foot|')/);
-  if (match) return parseFloat(match[1]) * 0.3048; // convert feet to meters
+// ─── Live Detection Configuration ─────────────────────────────────────────────
+const SCAN_INTERVAL_MS = 1500;           // scan every 1.5 seconds — maximum speed
+const MIN_SCAN_INTERVAL_MS = 1200;       // guard against overlapping scans
+const OBJECT_COOLDOWN_MS = 10000;        // don't re-announce same object within 10s
 
-  const matchM = lower.match(/(\d+(?:\.\d+)?)\s*(?:meter|m\b)/);
-  if (matchM) return parseFloat(matchM[1]);
+// ─── Critical objects for blind navigation ────────────────────────────────────
+// Priority order — PATH (straight ahead) is highest, then others
+const CRITICAL_TYPES = [
+  'stair', 'step', 'curb',              // fall hazards — highest priority
+  'door', 'entrance', 'exit', 'glass',  // navigational landmarks
+  'person', 'people', 'crowd',          // moving hazards
+  'car', 'vehicle', 'bike',             // traffic hazards
+  'pole', 'post', 'pillar', 'column',   // collision hazards
+  'wall', 'fence', 'barrier',           // blockages — always report
+  'sign', 'table', 'bench',             // secondary obstacles
+];
 
-  return null; // no parseable distance
-};
-
-// Extract a stable key for an obstacle based on direction and rough type
-const getObstacleKey = (direction, text) => {
-  const lower = text.toLowerCase();
-  // Normalize to direction + first meaningful word
-  const words = lower.split(/\s+/).filter(w => w.length > 3 && !['there', 'ahead', 'visible', 'about'].includes(w));
-  const typeWord = words[0] || 'object';
-  return `${direction}:${typeWord}`;
-};
-
-// Determine which direction category an obstacle belongs to
-const getDirectionCategory = (text) => {
-  const lower = text.toLowerCase();
-  if (lower.includes('left')) return 'LEFT';
-  if (lower.includes('right')) return 'RIGHT';
-  if (lower.includes('path') || lower.includes('ahead') || lower.includes('front')) return 'PATH';
-  if (lower.includes('door')) return 'DOOR';
-  return 'OTHER';
-};
-
-// Parse Gemini's response text to extract structured obstacle info
-const parseObstaclesFromResponse = (responseText) => {
-  const obstacles = [];
-  const lines = responseText.split('\n').map(l => l.trim()).filter(Boolean);
-
-  let currentSection = 'OTHER';
-
-  for (const line of lines) {
-    const upper = line.toUpperCase();
-
-    // Detect section headers
-    if (upper.startsWith('PATH') || upper.includes('CENTER PATH') || upper.includes('PATH AHEAD')) {
-      currentSection = 'PATH';
-    } else if (upper.startsWith('LEFT')) {
-      currentSection = 'LEFT';
-    } else if (upper.startsWith('RIGHT')) {
-      currentSection = 'RIGHT';
-    } else if (upper.startsWith('HAZARD') || upper.includes('danger')) {
-      currentSection = 'HAZARD';
-    } else if (upper.startsWith('DOOR')) {
-      currentSection = 'DOOR';
-    }
-
-    // Extract distance mentions from any line
-    const distance = parseDistance(line);
-    if (distance !== null) {
-      const key = getObstacleKey(currentSection, line);
-      obstacles.push({
-        key,
-        direction: currentSection,
-        description: line,
-        distanceMeters: distance,
-        isHazard: currentSection === 'HAZARD',
-      });
-    }
-  }
-
-  return obstacles;
-};
-
-// Decide if an obstacle announcement is warranted
-const shouldAnnounce = (obstacle) => {
-  const existing = announcedObstacles.get(obstacle.key);
-  const now = Date.now();
-
-  if (!existing) return true; // new obstacle
-
-  // Hazard always re-announces (dangerous)
-  if (obstacle.isHazard) {
-    // But still respect cooldown for the same exact hazard
-    if (now - existing.lastAnnouncedAt < ANNOUNCEMENT_COOLDOWN_MS) return false;
-    return true;
-  }
-
-  // Don't repeat same obstacle within cooldown
-  if (now - existing.lastAnnouncedAt < ANNOUNCEMENT_COOLDOWN_MS) return false;
-
-  // Announce if distance changed significantly
-  const distanceChangeFt = Math.abs(obstacle.distanceMeters - existing.lastDistance) * 3.28084;
-  if (distanceChangeFt >= SIGNIFICANT_DISTANCE_CHANGE_FT) return true;
-
-  // Announce if description changed meaningfully
-  if (obstacle.description !== existing.lastDescription) return true;
-
-  return false;
-};
-
-// Build the announcement text for a new/changed obstacle
-const buildAnnouncementText = (obstacles) => {
-  const parts = [];
-
-  // Sort: hazards first, then by distance (closest first)
-  const sorted = [...obstacles].sort((a, b) => {
-    if (a.isHazard && !b.isHazard) return -1;
-    if (!a.isHazard && b.isHazard) return 1;
-    return a.distanceMeters - b.distanceMeters;
-  });
-
-  for (const obs of sorted) {
-    const feet = Math.round(obs.distanceMeters * 3.28084);
-    const distText = feet < 50
-      ? `${feet} feet`
-      : feet < 500
-        ? `about ${Math.round(feet / 10) * 10} feet`
-        : `about ${Math.round(feet / 50) * 50} feet`;
-
-    let announcement = '';
-    const lower = obs.description.toLowerCase();
-
-    if (obs.isHazard) {
-      announcement = `Warning — ${obs.description}. ${distText} ahead.`;
-    } else if (obs.direction === 'PATH' || obs.direction === 'OTHER') {
-      announcement = `${obs.description}. ${distText} ahead.`;
-    } else {
-      const dir = obs.direction === 'LEFT' ? 'left' : obs.direction === 'RIGHT' ? 'right' : '';
-      announcement = `${obs.description}. ${dir ? `${dir.charAt(0) + dir.slice(1)} side. ` : ''}${distText} ahead.`;
-    }
-
-    parts.push(announcement);
-  }
-
-  return parts.join(' ');
-};
-
-// ─── Obstacle Monitor ──────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 let monitorIntervalId = null;
-let lastScannedAt = 0;
 let isScanningRef = { current: false };
-let onObstaclesDetectedRef = { current: null }; // callback(newObstacles, announcementText)
+let onObstaclesDetectedRef = { current: null };
+let lastAnalysisTime = 0;
+
+// Per-object cooldown: maps object type → last announced timestamp
+const lastAnnouncedTimeByType = {};
+
+
 
 // Live context refs — updated from outside so scans always use current state
 let contextRefs = {
@@ -155,88 +36,224 @@ let contextRefs = {
   getDestination: () => null,
 };
 
+// ─── Context Setters ───────────────────────────────────────────────────────────
 export const setObstacleContextRefs = (refs) => {
   contextRefs = { ...contextRefs, ...refs };
 };
 
-export const startObstacleMonitor = (cameraRef, options = {}) => {
-  if (monitorIntervalId) return; // already running
+// ─── Get object base type for cooldown matching ───────────────────────────────
+const getBaseType = (text) => {
+  const lower = text.toLowerCase();
+  for (const t of CRITICAL_TYPES) {
+    if (lower.includes(t)) return t;
+  }
+  return null; // not a critical object — discard
+};
 
-  const {
-    scanIntervalMs = SCAN_INTERVAL_MS,
-    onObstacles,
-  } = options;
+// ─── Parse one line — returns { baseType, objectName, direction } or null ──────────────
+const parseLine = (line) => {
+  let raw = line.toLowerCase().trim();
+
+  // Extract prefix direction context
+  let prefixDir = null;
+  if (raw.startsWith('path:')) {
+    raw = raw.substring(5).trim();
+  } else if (raw.startsWith('left:')) {
+    raw = raw.substring(5).trim();
+    prefixDir = 'on your left';
+  } else if (raw.startsWith('right:')) {
+    raw = raw.substring(6).trim();
+    prefixDir = 'on your right';
+  } else {
+    raw = raw.replace(/^[a-z]+:\s*/i, '').trim();
+  }
+
+  // Strip stray distances
+  raw = raw.replace(/\d+(?:\.\d+)?\s*(?:feet|ft|foot|meters?|m)\b/gi, '').trim();
+  // Remove filler
+  raw = raw.replace(/^(there is|there's|i see|you see|a |an |the )\s*/i, '').trim();
+
+  if (raw.length < 2) return null;
+
+  // Detect embedded precise direction (e.g. "wall slight left", "stairs straight ahead")
+  const DIR_PATTERNS = [
+    /\bstraight ahead\b/,
+    /\bslight(?:ly)?\s+left\b/,
+    /\bslight(?:ly)?\s+right\b/,
+    /\bfar\s+left\b/,
+    /\bfar\s+right\b/,
+    /\bon\s+(?:your\s+)?left\b/,
+    /\bon\s+(?:your\s+)?right\b/,
+    /\bahead\b/,
+  ];
+
+  let direction = null;
+  for (const pat of DIR_PATTERNS) {
+    const m = raw.match(pat);
+    if (m) {
+      direction = m[0].trim();
+      // Remove the direction fragment from the object name
+      raw = raw.replace(pat, '').trim().replace(/,\s*$/, '').trim();
+      break;
+    }
+  }
+
+  // Fall back to prefix-derived direction
+  if (!direction && prefixDir) direction = prefixDir;
+  if (!direction) direction = 'straight ahead';
+
+  // Determine base type
+  const baseType = getBaseType(raw);
+  if (!baseType) return null;
+
+  // Capitalise object name
+  const objectName = raw.charAt(0).toUpperCase() + raw.slice(1);
+
+  return { baseType, objectName, direction };
+};
+
+// ─── Extract critical objects from Gemini response ──────────────────────────────────
+const extractCriticalObjects = (responseText) => {
+  const lines = responseText.split('\n').map(l => l.trim()).filter(Boolean);
+  const results = [];
+
+  // PATH first (straight-ahead obstacles have highest priority)
+  for (const line of lines) {
+    const upper = line.toUpperCase();
+    if (upper.startsWith('PATH') && !upper.match(/CLEAR|EMPTY|NOTHING|NO OBSTACLE/)) {
+      const parsed = parseLine(line);
+      if (parsed) results.push({ ...parsed, priority: 0 });
+    }
+  }
+
+  // Then LEFT and RIGHT
+  for (const line of lines) {
+    const upper = line.toUpperCase();
+    if ((upper.startsWith('LEFT') || upper.startsWith('RIGHT')) && !upper.match(/CLEAR|EMPTY|NOTHING|NO OBSTACLE/)) {
+      const parsed = parseLine(line);
+      if (parsed) results.push({ ...parsed, priority: 1 });
+    }
+  }
+
+  return results;
+};
+
+// ─── Group objects by type and merge directions ────────────────────────────────────
+// Returns [{ baseType, announcement }] — one entry per unique object type
+const groupByType = (objects) => {
+  const map = new Map(); // baseType → { objectName, directions: Set }
+
+  for (const { baseType, objectName, direction } of objects) {
+    if (!map.has(baseType)) {
+      map.set(baseType, { objectName, directions: new Set() });
+    }
+    map.get(baseType).directions.add(direction);
+  }
+
+  const grouped = [];
+  for (const [baseType, { objectName, directions }] of map.entries()) {
+    const dirList = [...directions];
+    let announcement;
+    if (dirList.length === 1) {
+      announcement = `${objectName} ${dirList[0]}`;
+    } else {
+      // "Wall on your left, slight right, and straight ahead"
+      const last = dirList.pop();
+      announcement = `${objectName} ${dirList.join(', ')}, and ${last}`;
+    }
+    grouped.push({ baseType, announcement });
+  }
+
+  return grouped;
+};
+
+
+
+// ─── Obstacle Monitor ─────────────────────────────────────────────────────────
+export const startObstacleMonitor = (cameraRef, options = {}) => {
+  if (monitorIntervalId) return;
+
+  const { onObstacles, onHaptic } = options;
 
   isScanningRef.current = false;
   onObstaclesDetectedRef.current = onObstacles || null;
 
   const scan = async () => {
+    const now = Date.now();
+
     if (isScanningRef.current || !cameraRef?.current) return;
+    if (now - lastAnalysisTime < MIN_SCAN_INTERVAL_MS) return;
+
     isScanningRef.current = true;
 
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 0.5, base64: false });
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.2,
+        skipProcessing: true,
+        shutterSound: false,
+      });
 
-      // Pull live context at scan time — not at monitor start time
+      if (!photo?.uri) { isScanningRef.current = false; return; }
+
       const memoryContext = contextRefs.getMemoryContext();
       const communityHazards = contextRefs.getCommunityHazards();
       const destination = contextRefs.getDestination();
 
       const responseText = await analyzeScene({
         imageUri: photo.uri,
-        mode: 'navigate',
+        purpose: 'navigate',
         conversationHistory: [],
         memoryContext,
         communityHazards,
         destination,
       });
 
-      if (!responseText || responseText.includes('trouble analyzing')) {
-        isScanningRef.current = false;
-        return;
-      }
+      lastAnalysisTime = now;
 
-      const obstacles = parseObstaclesFromResponse(responseText);
+      if (!responseText || responseText.includes('trouble analyzing')) return;
 
-      // Check which obstacles need announcement
-      const toAnnounce = obstacles.filter(shouldAnnounce);
+      // Extract, group, and merge directions per object type
+      const objects = extractCriticalObjects(responseText);
+      if (objects.length === 0) return;
 
-      // Update tracking for all obstacles
-      const now = Date.now();
-      for (const obs of obstacles) {
-        announcedObstacles.set(obs.key, {
-          lastDistance: obs.distanceMeters,
-          lastAnnouncedAt: now,
-          lastDescription: obs.description,
-        });
-      }
+      const grouped = groupByType(objects);
 
-      // Clean up old entries (not seen in 2 minutes)
-      for (const [key, val] of announcedObstacles) {
-        if (now - val.lastAnnouncedAt > 120000) announcedObstacles.delete(key);
-      }
+      // Filter out types that were announced recently (per-type cooldown)
+      const newAnnouncements = grouped.filter(({ baseType }) => {
+        const lastTime = lastAnnouncedTimeByType[baseType] || 0;
+        return (now - lastTime) >= OBJECT_COOLDOWN_MS;
+      });
 
-      // Fire callback with announcement text if anything to say
-      if (toAnnounce.length > 0 && onObstaclesDetectedRef.current) {
-        const announcement = buildAnnouncementText(toAnnounce);
-        onObstaclesDetectedRef.current(obstacles, announcement);
-      }
+      if (newAnnouncements.length === 0) return;
 
-      lastScannedAt = now;
+        // Announce each unique object type instantly (directions already merged)
+        for (const { baseType, announcement } of newAnnouncements) {
+          lastAnnouncedTimeByType[baseType] = now;
+          const isHighDanger = ['stair', 'step', 'curb', 'car', 'vehicle'].includes(baseType);
+          // Fire haptic via UI-thread callback (avoids background context issues)
+          if (onHaptic) onHaptic(isHighDanger);
+          if (onObstaclesDetectedRef.current) {
+            onObstaclesDetectedRef.current([], announcement);
+          }
+        }
+
     } catch (err) {
-      console.error('Obstacle scan error:', err);
+      // Silently skip — usually "Image could not be captured" during camera warmup
+      if (!err?.message?.includes('could not be captured')) {
+        console.error('Obstacle scan error:', err);
+      }
     } finally {
       isScanningRef.current = false;
     }
   };
 
   // Start scanning
-  monitorIntervalId = setInterval(scan, scanIntervalMs);
-
-  // Run initial scan after 3 seconds
-  setTimeout(scan, 3000);
+  monitorIntervalId = setInterval(scan, SCAN_INTERVAL_MS);
+  // First scan after 1.5 seconds (camera needs time to warm up)
+  setTimeout(scan, 1500);
 };
 
+// ─── Stop Monitor ─────────────────────────────────────────────────────────────
 export const stopObstacleMonitor = () => {
   if (monitorIntervalId) {
     clearInterval(monitorIntervalId);
@@ -246,6 +263,7 @@ export const stopObstacleMonitor = () => {
   onObstaclesDetectedRef.current = null;
 };
 
+// ─── Clear Memory ─────────────────────────────────────────────────────────────
 export const clearObstacleMemory = () => {
-  announcedObstacles.clear();
+  Object.keys(lastAnnouncedTimeByType).forEach(k => delete lastAnnouncedTimeByType[k]);
 };

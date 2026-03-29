@@ -7,14 +7,15 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { WebView } from 'react-native-webview';
 import * as Location from 'expo-location';
-import { analyzeScene } from '../services/detectionService';
+import { analyzeScene, askAboutFrame, readVisibleText, chatWithLily } from '../services/detectionService';
 import { startObstacleMonitor, stopObstacleMonitor, clearObstacleMemory, setObstacleContextRefs } from '../services/obstacleService';
-import { speak, stopSpeaking } from '../services/speechService';
+import { speak, stopSpeaking, initVoice } from '../services/speechService';
 import { listenOnce } from '../services/voiceService';
 import { calculateNavigation, fetchRouteWithFallback, speakNavigationStep, speakUpcomingStep, getLocationById, getDistanceFromRoute } from '../services/navigationService';
 import { saveLocationMemory, getLocationMemory, formatMemoryContext } from '../services/memoryService';
 import { getNearbyHazards, subscribeToHazards } from '../services/hazardService';
-import { LOCATIONS } from '../constants/locations';
+import { LOCATIONS, NAVIGATION_CONFIG } from '../constants/locations';
+import * as Haptics from 'expo-haptics';
 
 const MAX_HISTORY_ENTRIES = 10;
 
@@ -130,9 +131,8 @@ export default function MobileModeScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [currentLocation, setCurrentLocation] = useState(null);
   const [selectedDestination, setSelectedDestination] = useState(null);
-  const [currentMode, setCurrentMode] = useState('navigate');
   const [isScanning, setIsScanning] = useState(false);
-  const [lastResponse, setLastResponse] = useState('Tap the microphone and speak a command.');
+  const [lastResponse, setLastResponse] = useState('Camera active. Obstacles are being monitored.');
   const [conversationHistory, setConversationHistory] = useState([]);
   const [memoryContext, setMemoryContext] = useState(null);
   const [communityHazards, setCommunityHazards] = useState([]);
@@ -147,7 +147,6 @@ export default function MobileModeScreen() {
   const [lastHeard, setLastHeard] = useState('');
   const [showDestPicker, setShowDestPicker] = useState(false);
   const [mapKey, setMapKey] = useState(0);
-  const [modeText, setModeText] = useState('');
   const [cameraReady, setCameraReady] = useState(false);
 
   const cameraRef = useRef(null);
@@ -156,14 +155,12 @@ export default function MobileModeScreen() {
   const hazardUnsubRef = useRef(null);
   const firstLocationRef = useRef(false);
 
-  const currentModeRef = useRef(currentMode);
   const lastResponseRef = useRef(lastResponse);
   const selectedDestRef = useRef(selectedDestination);
   const currentLocationRef = useRef(null);
   const routeDataIntervalRef = useRef(null);
   const lastRerouteTimeRef = useRef(null);
 
-  useEffect(() => { currentModeRef.current = currentMode; }, [currentMode]);
   useEffect(() => { lastResponseRef.current = lastResponse; }, [lastResponse]);
   useEffect(() => { selectedDestRef.current = selectedDestination; }, [selectedDestination]);
   useEffect(() => { currentLocationRef.current = currentLocation; }, [currentLocation]);
@@ -240,31 +237,10 @@ export default function MobileModeScreen() {
               speak(`Warning — ${newHazard.description} reported nearby.`, true);
             }
           );
-
-          // Wire up live context so obstacle scans always use current state
-          setObstacleContextRefs({
-            getMemoryContext: () => memoryContext,
-            getCommunityHazards: () => communityHazards,
-            getDestination: () => selectedDestRef.current ? getLocationById(selectedDestRef.current)?.name : null,
-          });
-
-          // Start obstacle monitoring after first location
-          startObstacleMonitor(cameraRef, {
-            onObstacles: (obstacles, announcement) => {
-              if (announcement) speak(announcement, true);
-            },
-          });
         }
       }
     );
   };
-
-  // ─── MODE CHANGE ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    const labels = { navigate: 'Navigate', read: 'Read Text', identify: 'Identify Objects' };
-    setModeText(labels[currentMode] || currentMode);
-    speak(`Now in ${currentMode} mode. Say scan to analyze.`);
-  }, [currentMode]);
 
   // ─── NAVIGATION: fetch route when destination changes ─────────────────────
   useEffect(() => {
@@ -331,40 +307,104 @@ export default function MobileModeScreen() {
 
   // ─── VOICE COMMAND ───────────────────────────────────────────────────────
   const matchDestination = (heard) => {
-    const words = heard.split(/\s+/);
-    return LOCATIONS.find(loc =>
-      words.some(w => loc.name.toLowerCase().includes(w) || loc.id.includes(w))
-    ) || null;
+    const text = heard.toLowerCase();
+    const sortedLocs = [...LOCATIONS].sort((a,b) => b.name.length - a.name.length);
+    for (const loc of sortedLocs) {
+      const cleanName = loc.name.split('(')[0].trim().toLowerCase();
+      if (text.includes(cleanName) || text.includes(loc.id.toLowerCase())) {
+         return loc;
+      }
+    }
+    if (text.includes('engineering') && !text.includes('chemical')) return LOCATIONS.find(l => l.id === 'enb');
+    if (text.includes('library')) return LOCATIONS.find(l => l.id === 'library');
+    if (text.includes('marshall') || text.includes('msc')) return LOCATIONS.find(l => l.id === 'msb');
+    return null;
   };
+
+  // ─── GENERAL CONVERSATION WITH LILY ─────────────────────────────────────────
+  const handleLilyChat = useCallback(async (message) => {
+    stopSpeaking();
+    try {
+      // Optionally capture current frame for visual context
+      let imageUri = null;
+      if (cameraRef.current) {
+        const photo = await cameraRef.current.takePictureAsync({ quality: 0.3, skipProcessing: true, shutterSound: false }).catch(() => null);
+        imageUri = photo?.uri || null;
+      }
+      const reply = await chatWithLily(message, imageUri);
+      setLastResponse(reply);
+      speak(reply, true);
+    } catch {
+      speak("I'm here! Try asking me something again.");
+    }
+  }, []);
+
+  // ─── READ VISIBLE TEXT (OCR) ───────────────────────────────────────────────────
+  const handleReadText = useCallback(async () => {
+    if (!cameraRef.current) { speak('Camera not ready.'); return; }
+    stopSpeaking();
+    speak('Reading the text...');
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.5, skipProcessing: true, shutterSound: false });
+      const result = await readVisibleText(photo.uri);
+      setLastResponse(result);
+      speak(result, true);
+    } catch {
+      speak('Could not read text. Try again.');
+    }
+  }, []);
+
+  // ─── QUESTION ABOUT FRAME ─────────────────────────────────────────────────
+  const handleQuestion = useCallback(async (question) => {
+    if (!cameraRef.current || isScanning) {
+      speak('Camera not ready. Try again.');
+      return;
+    }
+    stopSpeaking();
+    speak('Let me look at that for you...');
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.4, skipProcessing: true, shutterSound: false });
+      const answer = await askAboutFrame(photo.uri, question);
+      setLastResponse(answer);
+      speak(answer, true);
+    } catch {
+      speak('Could not answer that. Try again.');
+    }
+  }, [isScanning]);
 
   const handleVoiceCommand = useCallback(({ command, args }) => {
     const response = lastResponseRef.current;
     const heard = (args[0] || '').toLowerCase();
 
     switch (command) {
-      case 'navigate':    setCurrentMode('navigate'); speak('Navigate mode.'); break;
-      case 'read':         setCurrentMode('read'); speak('Read mode.'); break;
-      case 'identify':     setCurrentMode('identify'); speak('Identify mode.'); break;
-      case 'scan':         triggerScan(); break;
-      case 'repeat':       response ? speak(response, true) : speak('Say scan first.'); break;
-      case 'help':
-        speak('Say scan to analyze. Say navigate, read, or identify to change mode. Say a building name to navigate there. Say panic if lost.', true);
+      case 'scan':     triggerScan(); break;
+      case 'read':     handleReadText(); break;
+      case 'repeat':   response ? speak(response, true) : speak('I haven\'t scanned anything yet. Try saying scan first.'); break;
+      case 'help':     speak('I\'m Lily, your guide! You can say: scan to look around, read the sign, where is the door, or just name a building to navigate there.', true); break;
+      case 'panic':    triggerPanic(); break;
+      case 'stop':     stopSpeaking(); break;
+      case 'question': handleQuestion(heard); break;
+      case 'navigate': {
+        const loc = matchDestination(heard);
+        if (loc) { pickDestination(loc.id); break; }
+        // Didn't match a building — treat as chat
+        handleLilyChat(heard);
         break;
-      case 'panic':        triggerPanic(); break;
-      case 'stop':         stopSpeaking(); break;
-      case null: {
+      }
+      case null:
+      default: {
+        // First check if it sounds like navigation
         const loc = matchDestination(heard);
         if (loc) {
           pickDestination(loc.id);
         } else {
-          speak(`Didn't catch that. Say scan or help.`);
+          // Otherwise hand off to Lily for general conversation
+          handleLilyChat(heard);
         }
         break;
       }
-      default:
-        speak('Microphone error. Try again.');
     }
-  }, [pickDestination]);
+  }, [pickDestination, handleQuestion, handleReadText, handleLilyChat]);
 
   // ─── SCAN ────────────────────────────────────────────────────────────────
   const triggerScan = useCallback(() => {
@@ -376,15 +416,15 @@ export default function MobileModeScreen() {
     if (!cameraRef.current || isScanning) return;
     setIsScanning(true);
     stopSpeaking();
-    speak('Scanning...');
+    speak('Let me take a look around for you...');
 
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 0.7, base64: false });
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.3, base64: false, skipProcessing: true, shutterSound: false });
       const destName = selectedDestination ? getLocationById(selectedDestination)?.name : null;
 
       const response = await analyzeScene({
         imageUri: photo.uri,
-        mode: currentModeRef.current,
+        purpose: 'navigate',
         conversationHistory,
         memoryContext,
         communityHazards,
@@ -398,7 +438,7 @@ export default function MobileModeScreen() {
       setConversationHistory(prev => {
         const next = [
           ...prev,
-          { role: 'user', parts: [{ text: `[${currentModeRef.current} scan]` }] },
+          { role: 'user', parts: [{ text: '[scan]' }] },
           { role: 'model', parts: [{ text: response }] },
         ];
         return next.slice(-MAX_HISTORY_ENTRIES);
@@ -414,7 +454,7 @@ export default function MobileModeScreen() {
       }
     } catch (err) {
       console.error('Scan error:', err);
-      const msg = 'Scan failed. Try again.';
+      const msg = 'I had trouble scanning just now. Let\'s try that again.';
       setLastResponse(msg);
       speak(msg);
     } finally {
@@ -435,7 +475,7 @@ export default function MobileModeScreen() {
 
       const response = await analyzeScene({
         imageUri: photo.uri,
-        mode: 'panic',
+        purpose: 'panic',
         conversationHistory: [],
         memoryContext,
         communityHazards,
@@ -459,6 +499,8 @@ export default function MobileModeScreen() {
   // ─── MIC ─────────────────────────────────────────────────────────────────
   const handleMicTap = async () => {
     if (isListening || isScanning) return;
+    // Confirm mic is active with a light tap
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     setLastHeard('');
     await listenOnce(
       (cmd) => {
@@ -469,13 +511,37 @@ export default function MobileModeScreen() {
     );
   };
 
-  const handlePanicButton = () => performPanic();
-
   // ─── CAMERA REF CALLBACK ─────────────────────────────────────────────────
   const handleCameraRef = (ref) => {
     cameraRef.current = ref;
     if (ref) setCameraReady(true);
   };
+
+  // Start obstacle monitor as soon as camera is ready (no waiting for GPS)
+  useEffect(() => {
+    if (!cameraReady) return;
+    setObstacleContextRefs({
+      getMemoryContext: () => memoryContext,
+      getCommunityHazards: () => communityHazards,
+      getDestination: () => selectedDestRef.current ? getLocationById(selectedDestRef.current)?.name : null,
+    });
+    // Init Lily's female voice then greet
+    initVoice().then(() => {
+      speak("Hi there! I'm Lily, your guide. I'm already watching out for you. Tap the mic to ask me anything.", true);
+    });
+    startObstacleMonitor(cameraRef, {
+      onObstacles: (obstacles, announcement) => {
+        if (announcement) speak(announcement, true);
+      },
+      onHaptic: (isHighDanger) => {
+        if (isHighDanger) {
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+        } else {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+        }
+      },
+    });
+  }, [cameraReady]);
 
   // ─── PERMISSION STATES ────────────────────────────────────────────────────
   if (!cameraPermission) return (
@@ -514,10 +580,6 @@ export default function MobileModeScreen() {
 
         {/* Overlay badges */}
         <View style={styles.cameraOverlay}>
-          <View style={styles.modeBadge}>
-            <Text style={styles.modeBadgeText}>{modeText.toUpperCase()}</Text>
-          </View>
-
           {dest && (
             <View style={styles.destPill}>
               <Text style={styles.destPillText}>→ {dest.name.split('(')[0].trim()}</Text>
@@ -537,13 +599,24 @@ export default function MobileModeScreen() {
         <WebView
           key={mapKey}
           ref={webViewRef}
-          source={{ html: mapHtml }}
+          source={{ html: mapHtml, baseUrl: 'https://campuseyes.local/' }}
           style={styles.webview}
           scrollEnabled={false}
           zoomEnabled={false}
           javaScriptEnabled={true}
-          originWhitelist={['*']}
+          domStorageEnabled={true}
+          allowFileAccess={true}
+          allowUniversalAccessFromFileURLs={true}
           onMessage={() => {}}
+          allowsInlineMediaPlayback={false}
+          mediaPlaybackRequiresUserAction={true}
+          onError={() => console.warn('WebView error')}
+          startInLoadingState={true}
+          renderLoading={() => (
+            <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#111118', justifyContent: 'center', alignItems: 'center' }}>
+              <Text style={{ color: '#666', fontSize: 14 }}>Loading map...</Text>
+            </View>
+          )}
         />
 
         {/* Nav instruction */}
@@ -592,22 +665,6 @@ export default function MobileModeScreen() {
         </View>
 
         {/* Mode buttons */}
-        <View style={styles.modeRow}>
-          {['navigate', 'read', 'identify'].map(mode => (
-            <TouchableOpacity
-              key={mode}
-              style={[styles.modeButton, currentMode === mode && styles.modeButtonActive]}
-              onPress={() => setCurrentMode(mode)}
-              disabled={isScanning}
-            >
-              <Text style={[styles.modeButtonText, currentMode === mode && styles.modeButtonTextActive]}>
-                {mode.charAt(0).toUpperCase() + mode.slice(1)}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-
-        {/* Mic + Panic */}
         <View style={styles.actionRow}>
           <TouchableOpacity
             style={[
@@ -624,15 +681,6 @@ export default function MobileModeScreen() {
             <Text style={styles.micButtonLabel}>
               {isListening ? 'LISTENING...' : isScanning ? 'SCANNING...' : 'TAP TO TALK'}
             </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.panicButton}
-            onPress={handlePanicButton}
-            activeOpacity={0.7}
-          >
-            <Text style={styles.panicIcon}>🆘</Text>
-            <Text style={styles.panicLabel}>I'M LOST</Text>
           </TouchableOpacity>
         </View>
       </View>
