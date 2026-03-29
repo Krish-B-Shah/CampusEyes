@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, ScrollView,
-  StyleSheet, SafeAreaView
+  StyleSheet
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
 import { analyzeScene } from '../services/detectionService';
 import { speak, stopSpeaking } from '../services/speechService';
 import { listenOnce } from '../services/voiceService';
 import { calculateNavigation, getLocationById } from '../services/navigationService';
+import { saveLocationMemory, getLocationMemory, formatMemoryContext } from '../services/memoryService';
+import { getNearbyHazards, reportHazard, subscribeToHazards } from '../services/hazardService';
 import { LOCATIONS } from '../constants/locations';
 
 const MODES = ['navigate', 'read', 'identify'];
@@ -16,6 +19,14 @@ const MODE_ICONS  = { navigate: '🧭', read: '📖', identify: '🔍' };
 const MODE_LABELS = { navigate: 'NAVIGATE', read: 'READ', identify: 'IDENTIFY' };
 
 const COMMANDS_HELP = `Available commands: Say "navigate" to switch to navigation mode. Say "read" to read text. Say "identify" to identify objects. Say "scan" to analyze your surroundings. Say "where am I" to repeat the last result. Say "help" to hear commands again.`;
+
+const HAZARD_TYPES = [
+  'Wet floor',
+  'Obstacle blocking path',
+  'Broken elevator',
+  'Construction ahead',
+  'Crowded hallway',
+];
 
 export default function MobileModeScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -34,11 +45,16 @@ export default function MobileModeScreen() {
 
   const cameraRef = useRef(null);
   const navIntervalRef = useRef(null);
+  const hazardUnsubscribeRef = useRef(null);
+  const firstLocationLoaded = useRef(false);
 
   // ─── PERMISSIONS ──────────────────────────────────────────────────────────
   useEffect(() => {
     requestCameraPermission();
     requestLocationPermission();
+    return () => {
+      if (hazardUnsubscribeRef.current) hazardUnsubscribeRef.current();
+    };
   }, []);
 
   const requestLocationPermission = async () => {
@@ -52,7 +68,33 @@ export default function MobileModeScreen() {
   const startLocationTracking = async () => {
     await Location.watchPositionAsync(
       { accuracy: Location.Accuracy.High, timeInterval: 1000, distanceInterval: 2 },
-      (loc) => setCurrentLocation(loc.coords)
+      async (loc) => {
+        const coords = loc.coords;
+        setCurrentLocation(coords);
+
+        // ── First location: load memory + start hazard subscription ──
+        if (!firstLocationLoaded.current) {
+          firstLocationLoaded.current = true;
+
+          // Load memory for this location
+          const memory = await getLocationMemory(coords.latitude, coords.longitude);
+          setMemoryContext(formatMemoryContext(memory));
+
+          // Start real-time hazard subscription
+          hazardUnsubscribeRef.current = subscribeToHazards(
+            coords.latitude,
+            coords.longitude,
+            (newHazard) => {
+              setCommunityHazards(prev => [...prev, newHazard]);
+              speak(`Warning — ${newHazard.description} reported nearby.`, true);
+            }
+          );
+
+          // Load initial nearby hazards
+          const hazards = await getNearbyHazards(coords.latitude, coords.longitude);
+          setCommunityHazards(hazards);
+        }
+      }
     );
   };
 
@@ -108,11 +150,16 @@ export default function MobileModeScreen() {
         stopSpeaking();
         break;
       case 'destination': {
-        const heard = args[0] || '';
+        const heard = (args[0] || '').toLowerCase();
         setLastHeard(heard);
-        const match = LOCATIONS.find(loc =>
-          heard.includes(loc.name.toLowerCase())
-        );
+        // Match against location names and short aliases
+        const match = LOCATIONS.find(loc => {
+          const full = loc.name.toLowerCase();
+          const short = loc.id.toLowerCase();
+          // Try to match "library", "en b", "engineer", etc.
+          const words = heard.split(/\s+/);
+          return words.some(w => full.includes(w) || w.includes(loc.id));
+        });
         if (match) {
           setSelectedDestination(match.id);
           speak(`Navigating to ${match.name}.`);
@@ -178,6 +225,26 @@ export default function MobileModeScreen() {
         }
       ]);
 
+      // ── After scan: save memory + refresh hazards ──
+      if (currentLocation) {
+        await saveLocationMemory(
+          currentLocation.latitude,
+          currentLocation.longitude,
+          response
+        );
+        const memory = await getLocationMemory(
+          currentLocation.latitude,
+          currentLocation.longitude
+        );
+        setMemoryContext(formatMemoryContext(memory));
+
+        const hazards = await getNearbyHazards(
+          currentLocation.latitude,
+          currentLocation.longitude
+        );
+        setCommunityHazards(hazards);
+      }
+
     } catch (err) {
       console.error('Scan error:', err);
       const msg = 'Scan failed. Please try again.';
@@ -216,6 +283,20 @@ export default function MobileModeScreen() {
     } finally {
       setIsScanning(false);
     }
+  };
+
+  // ─── HAZARD REPORTING ──────────────────────────────────────────────────────
+  const handleReportHazard = async (description) => {
+    if (!currentLocation) {
+      speak('Cannot report hazard without location access.');
+      return;
+    }
+    await reportHazard(
+      currentLocation.latitude,
+      currentLocation.longitude,
+      description
+    );
+    speak(`Reported: ${description}. Thank you for helping other students.`);
   };
 
   // ─── MODE SWITCH (tap) ─────────────────────────────────────────────────────
@@ -298,6 +379,9 @@ export default function MobileModeScreen() {
         {lastHeard ? (
           <Text style={styles.lastHeardText}>Heard: "{lastHeard}"</Text>
         ) : null}
+        {memoryContext ? (
+          <Text style={styles.memoryBadgeText}>🧠 {memoryContext.slice(0, 60)}...</Text>
+        ) : null}
       </View>
 
       {/* ── NAVIGATION BANNER ── */}
@@ -345,6 +429,25 @@ export default function MobileModeScreen() {
       >
         <Text style={styles.panicText}>🆘  I'M LOST</Text>
       </TouchableOpacity>
+
+      {/* ── HAZARD REPORT ROW ── */}
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.hazardReportRow}
+      >
+        {HAZARD_TYPES.map(type => (
+          <TouchableOpacity
+            key={type}
+            style={styles.hazardReportButton}
+            onPress={() => handleReportHazard(type)}
+            accessibilityLabel={`Report hazard: ${type}`}
+            accessibilityRole="button"
+          >
+            <Text style={styles.hazardReportText}>⚠️ {type}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
 
       {/* ── DESTINATION SELECTOR ── */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.destinationRow}>
@@ -460,7 +563,7 @@ const styles = StyleSheet.create({
   responseScrollContent: { flexGrow: 1 },
   responseText: {
     color: '#fff',
-    fontSize: 24,       // Large text for accessibility + judges
+    fontSize: 24,
     lineHeight: 34,
     fontWeight: '300',
   },
@@ -469,6 +572,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginTop: 8,
     fontStyle: 'italic',
+  },
+  memoryBadgeText: {
+    color: '#10b981',
+    fontSize: 12,
+    marginTop: 8,
   },
 
   // Nav banner
@@ -514,21 +622,38 @@ const styles = StyleSheet.create({
   },
   panicText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
 
+  // Hazard report row
+  hazardReportRow: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    maxHeight: 44,
+  },
+  hazardReportButton: {
+    backgroundColor: '#2a1a00',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: '#92400e',
+  },
+  hazardReportText: { color: '#fbbf24', fontSize: 12, fontWeight: '500' },
+
   // Destination row
   destinationRow: {
     paddingHorizontal: 12,
-    paddingVertical: 10,
-    maxHeight: 56,
+    paddingVertical: 8,
+    maxHeight: 50,
   },
   destButton: {
     backgroundColor: '#1a1a2a',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
     borderRadius: 10,
     marginRight: 8,
     borderWidth: 1,
     borderColor: '#2a2a3a',
   },
   destButtonActive: { backgroundColor: '#065f46', borderColor: '#10b981' },
-  destText: { color: '#ccc', fontSize: 13, fontWeight: '500' },
+  destText: { color: '#ccc', fontSize: 12, fontWeight: '500' },
 });

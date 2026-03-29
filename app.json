@@ -50,7 +50,8 @@
           "locationWhenInUsePermission": "CampusEyes needs location access for navigation"
         }
       ],
-      "expo-font"
+      "expo-font",
+      "expo-audio"
     ]
   }
 }

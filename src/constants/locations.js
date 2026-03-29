@@ -1,37 +1,57 @@
-// Hardcoded university locations with coordinates
 export const LOCATIONS = [
   {
+    id: 'enb',
+    name: 'Engineering Building (ENB)',
+    latitude: 28.05872,
+    longitude: -82.41388,
+  },
+  {
+    id: 'che',
+    name: 'Chemical Engineering (CHE)',
+    latitude: 28.05940,
+    longitude: -82.41420,
+  },
+  {
+    id: 'rec',
+    name: 'Recreation Center',
+    latitude: 28.06210,
+    longitude: -82.41340,
+  },
+  {
     id: 'library',
-    name: 'Library',
-    latitude: 37.7749,
-    longitude: -122.4194,
-    description: 'Main University Library'
+    name: 'USF Library (LIB)',
+    latitude: 28.06120,
+    longitude: -82.41500,
   },
   {
-    id: 'main-gate',
-    name: 'Main Gate',
-    latitude: 37.7750,
-    longitude: -122.4180,
-    description: 'University Main Entrance'
+    id: 'msb',
+    name: 'Marshall Student Center',
+    latitude: 28.06010,
+    longitude: -82.41270,
   },
   {
-    id: 'student-center',
-    name: 'Student Center',
-    latitude: 37.7745,
-    longitude: -122.4200,
-    description: 'Student Center Building'
-  }
+    id: 'cutr',
+    name: 'CUTR Building',
+    latitude: 28.05910,
+    longitude: -82.41350,
+  },
+  {
+    id: 'enc',
+    name: 'ENC Building',
+    latitude: 28.05950,
+    longitude: -82.41310,
+  },
 ];
 
-// Objects to detect
-export const DETECTION_OBJECTS = ['person', 'chair', 'table', 'door'];
+export const DETECTION_OBJECTS = [
+  'person', 'chair', 'table', 'door',
+  'bench', 'bicycle', 'car', 'stairs',
+];
 
-// Speech cooldown in milliseconds
-export const SPEECH_COOLDOWN = 3000;
+export const SPEECH_COOLDOWN = 2000;
 
-// Navigation settings
 export const NAVIGATION_CONFIG = {
-  arrivalThreshold: 20, // meters
-  straightThreshold: 30, // degrees
-  nearThreshold: 50 // meters
+  arrivalThreshold: 15,
+  straightThreshold: 25,
+  nearThreshold: 50,
 };

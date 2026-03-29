@@ -1,7 +1,11 @@
-import { Audio } from 'expo-av';
+import { Audio } from 'expo-audio';
 import { transcribeAudio } from './sttService';
 
-// ─── Command vocabulary ───────────────────────────────────────────────────────
+// ─── STT Cooldown — prevents burning through Gemini quota ──────────────────
+const STT_COOLDOWN_MS = 3000;
+let lastSttTime = 0;
+
+// ─── Command vocabulary ───────────────────────────────────────────────────
 
 const COMMAND_PATTERNS = {
   navigate: [/navigate|navigation|nav/i, /go to navigate/i],
@@ -32,81 +36,36 @@ export const parseCommand = (text) => {
     }
   }
 
-  // Check if it matches a destination name
   return { command: 'destination', args: [lower] };
 };
 
-// ─── Permission ───────────────────────────────────────────────────────────────
+// ─── Permission ────────────────────────────────────────────────────────────
 
 export const requestMicPermission = async () => {
   const { status } = await Audio.requestPermissionsAsync();
   return status === 'granted';
 };
 
-// ─── Recording ───────────────────────────────────────────────────────────────
+// ─── Recording state ───────────────────────────────────────────────────────
 
 let recording = null;
 let isRecordingActive = false;
 
 /**
- * Starts recording audio. Calls onInterim with transcribed chunks as available.
- * @param {function} onInterim - called with partial transcription
- * @param {function} onFinal - called with final transcription
- */
-export const startRecording = async (onInterim, onFinal) => {
-  if (isRecordingActive) return;
-
-  try {
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: true,
-      playsInSilentModeIOS: true,
-    });
-
-    const { recording: rec } = await Audio.Recording.createAsync(
-      Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      // onStatusUpdate — expo-av doesn't stream transcriptions mid-recording,
-      // so we record a clip and transcribe on stop
-      undefined,
-      100, // update interval ms (not used for transcription)
-    );
-
-    recording = rec;
-    isRecordingActive = true;
-  } catch (err) {
-    console.error('startRecording error:', err);
-  }
-};
-
-/**
- * Stops the current recording and returns the URI.
- * @returns {Promise<string|null>}
- */
-export const stopRecording = async () => {
-  if (!recording || !isRecordingActive) return null;
-
-  try {
-    isRecordingActive = false;
-    await recording.stopAndUnloadAsync();
-    await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-
-    const uri = recording.getURI();
-    recording = null;
-    return uri;
-  } catch (err) {
-    console.error('stopRecording error:', err);
-    recording = null;
-    isRecordingActive = false;
-    return null;
-  }
-};
-
-/**
  * Full listen cycle: record → transcribe → parse → call onCommand.
+ * Includes a 3-second cooldown to prevent Gemini quota exhaustion.
  * @param {function} onCommand - called with { command, args }
  * @param {function} onListening - called with boolean (listening state)
  */
 export const listenOnce = async (onCommand, onListening) => {
   if (isRecordingActive) return;
+
+  // Cooldown guard — prevents STT spam
+  const now = Date.now();
+  if (now - lastSttTime < STT_COOLDOWN_MS) {
+    onCommand({ command: 'error', args: ['please wait a moment before speaking again'] });
+    return;
+  }
 
   const granted = await requestMicPermission();
   if (!granted) {
@@ -142,6 +101,7 @@ export const listenOnce = async (onCommand, onListening) => {
       return;
     }
 
+    lastSttTime = Date.now();
     const text = await transcribeAudio(uri);
     onListening(false);
 
