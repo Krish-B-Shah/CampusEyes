@@ -28,19 +28,21 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
-// Converts meters to a human-readable feet string
-const formatDistanceText = (distanceMeters) => {
+// Converts meters to a human-readable string like '0.5 miles' or '200 feet'
+export const formatDistanceText = (distanceMeters) => {
   const feet = distanceMeters * METERS_TO_FEET;
 
+  if (feet >= 528) {
+    const miles = feet / 5280;
+    return `${miles.toFixed(1)} miles`;
+  }
   if (feet < 50) {
-    return `${Math.round(feet)} feet ahead`;
+    return `${Math.round(feet)} feet`;
   }
   if (feet < 500) {
-    return `about ${Math.round(feet / 5) * 5} feet ahead`;
+    return `${Math.round(feet / 10) * 10} feet`;
   }
-  // Convert to yards for longer distances
-  const yards = feet / 3;
-  return `about ${Math.round(yards / 10) * 10} yards ahead`;
+  return `${Math.round(feet / 50) * 50} feet`;
 };
 
 // OSRM walking route fetch — returns { geometry: [[lon,lat],...], steps: [{instruction, distance}], distanceMeters, durationSeconds, provider }
@@ -136,6 +138,12 @@ let lastSpokenStepIndex = -1;
 let lastSpokenInstruction = '';
 let lastAnnouncedStepIndex = -1;
 
+export const resetNavigationState = () => {
+  lastSpokenStepIndex = -1;
+  lastSpokenInstruction = '';
+  lastAnnouncedStepIndex = -1;
+};
+
 export const speakNavigationStep = (routeData, userLat, userLon) => {
   if (!routeData?.steps?.length) return null;
   if (routeData.provider === 'straight') return null; // bearing fallback handles this
@@ -165,18 +173,71 @@ export const speakNavigationStep = (routeData, userLat, userLon) => {
   const currentStep = routeData.steps[currentStepIdx];
   if (!currentStep) return null;
 
-  // Only speak if it's a new step
-  if (currentStepIdx !== lastSpokenStepIndex) {
+  let isNewStep = false;
+  // Only speak if it's a new step and we have advanced forward (prevents boundary spam)
+  if (currentStepIdx > lastSpokenStepIndex) {
     lastSpokenStepIndex = currentStepIdx;
-    lastSpokenInstruction = currentStep.instruction;
+    
+    const rawInstruction = currentStep.instruction || 'Continue straight';
+    const isContinue = rawInstruction.toLowerCase().includes('keep') || rawInstruction.toLowerCase().includes('continue');
+    
+    // Skip voice announcement for minor "continue" segments under 15 meters to prevent spam
+    if (!(isContinue && currentStep.distance < 15)) {
+      lastSpokenInstruction = rawInstruction;
+      
+      // If it's a long segment, preview next step or tell them to continue
+      if (currentStep.distance >= 15 && currentStepIdx < routeData.steps.length - 1) {
+         const distText = formatDistanceText(currentStep.distance);
+         const nextInstruction = routeData.steps[currentStepIdx + 1]?.instruction || '';
+         const isNextContinue = nextInstruction.toLowerCase().includes('keep') || nextInstruction.toLowerCase().includes('continue');
+         
+         if (nextInstruction && !isNextContinue) {
+           const nextLower = nextInstruction.charAt(0).toLowerCase() + nextInstruction.slice(1);
+           lastSpokenInstruction += `. In ${distText}, ${nextLower}.`;
+         } else {
+           lastSpokenInstruction += `. Continue for ${distText}.`;
+         }
+      }
+      isNewStep = true;
+    } else {
+      // Still update the instruction property for the UI, but don't speak it
+      lastSpokenInstruction = rawInstruction;
+    }
   }
+
+  // Calculate real-time distance to the next turn/destination
+  const nextStepIdx = currentStepIdx + 1;
+  let distToNextTurn = 0;
+  let displayInstruction = "Continue";
+  
+  if (nextStepIdx < routeData.steps.length) {
+    const [startIdx] = routeData.steps[nextStepIdx].way_points || [0];
+    const nextCoord = coords[startIdx] || coords[coords.length - 1];
+    distToNextTurn = calculateDistance(userLat, userLon, nextCoord[1], nextCoord[0]);
+    displayInstruction = routeData.steps[nextStepIdx].instruction;
+  } else {
+    // Last step: distance to destination
+    const lastCoord = coords[coords.length - 1] || [0, 0];
+    distToNextTurn = calculateDistance(userLat, userLon, lastCoord[1], lastCoord[0]);
+    displayInstruction = "Arrive at destination";
+  }
+
+  // Calculate ETA (assume 1.4 m/s => 84 m/min)
+  let totalRemainingDist = distToNextTurn;
+  for (let s = nextStepIdx; s < routeData.steps.length; s++) {
+    totalRemainingDist += routeData.steps[s].distance;
+  }
+  const etaMinutes = Math.max(1, Math.ceil(totalRemainingDist / 84));
 
   return {
     stepIndex: currentStepIdx,
     totalSteps: routeData.steps.length,
     instruction: lastSpokenInstruction,
-    distanceMeters: currentStep.distance,
+    displayInstruction,
+    distanceMeters: distToNextTurn,
+    etaMinutes,
     routeGeometry: coords,
+    isNewStep,
   };
 };
 
@@ -190,16 +251,22 @@ export const getDirectionInstruction = (bearingDiff, distanceMeters) => {
   const distText = formatDistanceText(distanceMeters);
 
   if (Math.abs(bearingDiff) <= straightThreshold) {
-    return `Walk straight ahead. ${distText}.`;
+    return `Walk straight ahead. The destination is ${distText} away.`;
   }
-  if (bearingDiff > straightThreshold && bearingDiff <= 135) {
-    return `Turn right and walk. ${distText}.`;
+  if (bearingDiff > straightThreshold && bearingDiff <= 70) {
+    return `Turn slight right and walk. The destination is ${distText} away.`;
   }
-  if (bearingDiff < -straightThreshold && bearingDiff >= -135) {
-    return `Turn left and walk. ${distText}.`;
+  if (bearingDiff > 70 && bearingDiff <= 135) {
+    return `Turn right and walk. The destination is ${distText} away.`;
+  }
+  if (bearingDiff < -straightThreshold && bearingDiff >= -70) {
+    return `Turn slight left and walk. The destination is ${distText} away.`;
+  }
+  if (bearingDiff < -70 && bearingDiff >= -135) {
+    return `Turn left and walk. The destination is ${distText} away.`;
   }
 
-  return `Turn around. ${distText} behind you.`;
+  return `Turn around. The destination is ${distText} behind you.`;
 };
 
 // Perpendicular distance from point (px, py) to line segment (ax, ay)-(bx, by)
@@ -266,6 +333,10 @@ export const speakUpcomingStep = (routeData, userLat, userLon) => {
   const nextStep = routeData.steps[nextStepIdx];
   if (!nextStep) return null;
 
+  // Don't warn "In 30 feet, continue straight" — only warn for actual turns
+  const isContinue = nextStep.instruction?.toLowerCase().includes('keep') || nextStep.instruction?.toLowerCase().includes('continue');
+  if (isContinue) return null;
+
   const [startIdx] = nextStep.way_points || [0];
   const nextCoord = coords[startIdx] || coords[coords.length - 1];
   const distToNext = calculateDistance(userLat, userLon, nextCoord[1], nextCoord[0]);
@@ -273,13 +344,14 @@ export const speakUpcomingStep = (routeData, userLat, userLon) => {
   if (distToNext <= NAVIGATION_CONFIG.lookAheadDistance && nextStepIdx !== lastAnnouncedStepIndex) {
     lastAnnouncedStepIndex = nextStepIdx;
     const distText = formatDistanceText(distToNext);
-    return `In ${distText}, ${nextStep.instruction}`;
+    const instructionLower = nextStep.instruction.charAt(0).toLowerCase() + nextStep.instruction.slice(1);
+    return `In ${distText}, ${instructionLower}.`;
   }
 
   return null;
 };
 
-export const calculateNavigation = (currentLocation, destination) => {
+export const calculateNavigation = (currentLocation, destination, currentHeading = null) => {
   if (!currentLocation || !destination) return null;
 
   const distanceMeters = calculateDistance(
@@ -296,8 +368,18 @@ export const calculateNavigation = (currentLocation, destination) => {
     destination.longitude
   );
 
-  // Bearing diff vs absolute bearing: convert to -180..180 range
-  const bearingDiff = bearing > 180 ? bearing - 360 : bearing;
+  // If we have a compass heading, compute relative turn direction
+  let bearingDiff;
+  if (currentHeading !== null) {
+    bearingDiff = bearing - currentHeading;
+  } else {
+    // Graceful fallback if compass unavailable — absolute bearing
+    bearingDiff = bearing; 
+  }
+  
+  // Normalize to -180 to 180 degrees
+  bearingDiff = ((bearingDiff + 540) % 360) - 180;
+
   const instruction = getDirectionInstruction(bearingDiff, distanceMeters);
 
   return {
