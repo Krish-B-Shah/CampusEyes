@@ -127,7 +127,7 @@ const MAP_UPDATE_JS = (lat, lng, routeCoords, dest, isFallbackRoute) => `
   }
 `;
 
-export default function MobileModeScreen() {
+export default function MobileModeScreen({ initialUserData }) {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [currentLocation, setCurrentLocation] = useState(null);
   const headingAnim = useRef(new Animated.Value(0)).current;
@@ -149,6 +149,14 @@ export default function MobileModeScreen() {
   const [showDestPicker, setShowDestPicker] = useState(false);
   const [mapKey, setMapKey] = useState(0);
   const [cameraReady, setCameraReady] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
+  const [profile, setProfile] = useState({
+    name: initialUserData?.name || 'Student',
+    homeBuildingId: null,
+    walkingSpeed: 1.4,
+    age: initialUserData?.age || null,
+    campus: initialUserData?.campus || null,
+  });
 
   const cameraRef = useRef(null);
   const webViewRef = useRef(null);
@@ -297,8 +305,12 @@ export default function MobileModeScreen() {
           const info = speakNavigationStep(route, loc.latitude, loc.longitude);
           if (info) {
             setNavigationInfo(info);
-            // Speak the instruction aloud immediately if we reached a new step/turn
-            if (info.isNewStep && info.instruction) {
+            // Arrival detection
+            if (info.hasArrived && info.isNewStep) {
+              const bName = dest?.name?.split('(')[0]?.trim() || 'your destination';
+              speak(`You have reached ${bName}.`, true);
+              setSelectedDestination(null); // End navigation
+            } else if (info.isNewStep && info.instruction) {
               speak(info.instruction, true);
             }
           }
@@ -315,6 +327,12 @@ export default function MobileModeScreen() {
               distanceMeters: nav.distanceMeters,
               hasArrived: nav.hasArrived,
             });
+
+            if (nav.hasArrived) {
+              const bName = dest?.name?.split('(')[0]?.trim() || 'your destination';
+              speak(`You have reached ${bName}.`, true);
+              setSelectedDestination(null); // End navigation
+            }
           }
         }
       }, 3000);
@@ -555,7 +573,10 @@ export default function MobileModeScreen() {
     });
     // Init Lily's female voice then greet
     initVoice().then(() => {
-      speak("Hi there! I'm Lily, your guide. I'm already watching out for you. Tap the mic to ask me anything.", true);
+      const greeting = profile.name === 'Student' 
+        ? "Hi there! I'm Lily, your guide. I'm already watching out for you. Tap the mic to ask me anything."
+        : `Hi ${profile.name}! I'm Lily, your guide. I'm watching out for you. Ready to go?`;
+      speak(greeting, true);
     });
     startObstacleMonitor(cameraRef, {
       onObstacles: (obstacles, announcement) => {
@@ -640,11 +661,21 @@ export default function MobileModeScreen() {
 
         {/* Overlay badges */}
         <View style={styles.cameraOverlay}>
-          {dest && (
+          {dest ? (
             <View style={styles.destPill}>
               <Text style={styles.destPillText}>→ {dest.name.split('(')[0].trim()}</Text>
             </View>
-          )}
+          ) : <View />}
+
+          <TouchableOpacity 
+            style={styles.profileButton}
+            onPress={() => setShowProfile(true)}
+          >
+            <Text style={styles.profileButtonText}>
+              {profile.age && parseInt(profile.age) < 30 ? '🎓' : 
+               profile.age && parseInt(profile.age) >= 30 ? '🧑‍🏫' : '👤'}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         {isScanning && (
@@ -788,6 +819,90 @@ export default function MobileModeScreen() {
         </View>
       </Modal>
 
+      {/* ─── PROFILE MODAL ────────────────────────────────────────────── */}
+      <Modal
+        visible={showProfile}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowProfile(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <TouchableOpacity 
+            style={{ flex: 1 }} 
+            onPress={() => setShowProfile(false)}
+            activeOpacity={1}
+          />
+          <View style={[styles.modalContent, { maxHeight: '80%' }]}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Your Profile</Text>
+                <Text style={{ color: '#666', fontSize: 13 }}>Personalize your Lily experience</Text>
+              </View>
+              <TouchableOpacity onPress={() => setShowProfile(false)}>
+                <Text style={styles.modalClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            
+            <View style={styles.modalList}>
+              <Text style={styles.settingLabel}>Display Name</Text>
+              <TouchableOpacity 
+                style={styles.settingItem} 
+                onPress={() => {
+                  const newName = profile.name === 'Student' ? 'Krish' : 'Student';
+                  setProfile(p => ({ ...p, name: newName }));
+                }}
+              >
+                <Text style={styles.settingItemText}>{profile.name}</Text>
+                <Text style={{ color: '#3b82f6' }}>Change</Text>
+              </TouchableOpacity>
+
+              <Text style={styles.settingLabel}>Walking Pace</Text>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 20 }}>
+                {['Steady', 'Quick', 'Power'].map((speed, i) => {
+                  const values = [1.2, 1.4, 1.8];
+                  const isActive = profile.walkingSpeed === values[i];
+                  return (
+                    <TouchableOpacity 
+                      key={speed}
+                      style={[styles.speedOption, isActive && styles.speedOptionActive]}
+                      onPress={() => setProfile(p => ({ ...p, walkingSpeed: values[i] }))}
+                    >
+                      <Text style={[styles.speedOptionText, isActive && styles.speedOptionTextActive]}>{speed}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              <Text style={styles.settingLabel}>Quick Home Location</Text>
+              <TouchableOpacity style={styles.settingItem}>
+                <Text style={styles.settingItemText}>
+                  {profile.homeBuildingId ? getLocationById(profile.homeBuildingId)?.name : 'Not set'}
+                </Text>
+                <Text style={{ color: '#3b82f6' }}>Setup</Text>
+              </TouchableOpacity>
+
+              <View style={styles.profileStats}>
+                <View style={styles.statBox}>
+                  <Text style={styles.statVal}>3.2km</Text>
+                  <Text style={styles.statLabel}>Guided</Text>
+                </View>
+                <View style={styles.statBox}>
+                  <Text style={styles.statVal}>12</Text>
+                  <Text style={styles.statLabel}>Hazards Spotted</Text>
+                </View>
+              </View>
+
+              <TouchableOpacity 
+                style={styles.signOutButton}
+                onPress={() => setShowProfile(false)}
+              >
+                <Text style={styles.signOutText}>Save Preferences</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
     </SafeAreaView>
   );
 }
@@ -812,6 +927,8 @@ const styles = StyleSheet.create({
   modeBadgeText: { color: '#fff', fontSize: 13, fontWeight: 'bold', letterSpacing: 1 },
   destPill: { backgroundColor: 'rgba(16, 185, 129, 0.85)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, maxWidth: '55%' },
   destPillText: { color: '#fff', fontSize: 12, fontWeight: '600' },
+  profileButton: { width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(26, 26, 42, 0.85)', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+  profileButtonText: { fontSize: 18 },
   scanningBadge: { position: 'absolute', bottom: 12, alignSelf: 'center', backgroundColor: 'rgba(245, 158, 11, 0.9)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
   scanningText: { color: '#000', fontSize: 14, fontWeight: 'bold' },
 

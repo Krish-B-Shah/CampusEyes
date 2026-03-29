@@ -222,6 +222,14 @@ export const speakNavigationStep = (routeData, userLat, userLon) => {
     displayInstruction = "Arrive at destination";
   }
 
+  // Arrival detection (using threshold from constants)
+  const hasArrived = distToNextTurn < NAVIGATION_CONFIG.arrivalThreshold;
+  let finalInstruction = lastSpokenInstruction;
+
+  if (hasArrived && isNewStep) {
+    finalInstruction = "You have reached your destination.";
+  }
+
   // Calculate ETA (assume 1.4 m/s => 84 m/min)
   let totalRemainingDist = distToNextTurn;
   for (let s = nextStepIdx; s < routeData.steps.length; s++) {
@@ -232,12 +240,13 @@ export const speakNavigationStep = (routeData, userLat, userLon) => {
   return {
     stepIndex: currentStepIdx,
     totalSteps: routeData.steps.length,
-    instruction: lastSpokenInstruction,
+    instruction: finalInstruction,
     displayInstruction,
     distanceMeters: distToNextTurn,
     etaMinutes,
     routeGeometry: coords,
     isNewStep,
+    hasArrived,
   };
 };
 
@@ -382,10 +391,14 @@ export const calculateNavigation = (currentLocation, destination, currentHeading
 
   const instruction = getDirectionInstruction(bearingDiff, distanceMeters);
 
+  // Calculate ETA (assume 1.4 m/s => 84 m/min)
+  const etaMinutes = Math.max(1, Math.ceil(distanceMeters / 84));
+
   return {
     distanceMeters: Math.round(distanceMeters),
     bearing: Math.round(bearing),
     instruction,
+    etaMinutes,
     hasArrived: distanceMeters < NAVIGATION_CONFIG.arrivalThreshold,
   };
 };
