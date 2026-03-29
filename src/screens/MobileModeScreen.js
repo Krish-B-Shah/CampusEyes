@@ -5,6 +5,18 @@ import {
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
+import { LOCATIONS } from '../constants/locations';
+import {
+  calculateNavigation,
+  getLocationById,
+  buildWalkGraph,
+  getRouteSteps
+} from '../services/navigationService';
+import USF_MAP from '../../assets/USF_Map.json';
+import {
+  speak,
+  stopSpeaking
+} from '../services/speechService';
 import { analyzeScene } from '../services/detectionService';
 import { speak, stopSpeaking } from '../services/speechService';
 import { calculateNavigation, getLocationById } from '../services/navigationService';
@@ -17,7 +29,13 @@ export default function MobileModeScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [locationPermission, setLocationPermission] = useState(false);
   const [currentLocation, setCurrentLocation] = useState(null);
-  const [selectedDestination, setSelectedDestination] = useState(null);
+  const [navigationInfo, setNavigationInfo] = useState(null);
+  const [routeSteps, setRouteSteps] = useState([]);
+  const [routeStepIndex, setRouteStepIndex] = useState(0);
+  const [destinationLocation, setDestinationLocation] = useState(null);
+  const [modelLoaded, setModelLoaded] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [errorMessage, setErrorMessage] = useState(null);
   const [currentMode, setCurrentMode] = useState('navigate');
   const [isScanning, setIsScanning] = useState(false);
   const [lastResponse, setLastResponse] = useState('');
@@ -31,48 +49,115 @@ export default function MobileModeScreen() {
   const cameraRef = useRef(null);
   const navIntervalRef = useRef(null);
 
-  // --- PERMISSIONS ---
+  // Build walk graph from campus GeoJSON
+  useEffect(() => {
+    try {
+      buildWalkGraph(USF_MAP);
+    } catch (err) {
+      console.warn('Failed to build map graph:', err);
+    }
+  }, []);
+
+  // Request permissions
   useEffect(() => {
     requestCameraPermission();
     requestLocationPermission();
   }, []);
 
-  const requestLocationPermission = async () => {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status === 'granted') {
-      setLocationPermission(true);
-      startLocationTracking();
-    }
-  };
-
-  // --- LOCATION TRACKING ---
-  const startLocationTracking = async () => {
-    await Location.watchPositionAsync(
-      { accuracy: Location.Accuracy.High, timeInterval: 1000, distanceInterval: 2 },
-      (loc) => setCurrentLocation(loc.coords)
-    );
-  };
-
-  // --- NAVIGATION UPDATES ---
+  // Get location updates
   useEffect(() => {
-    if (navIntervalRef.current) clearInterval(navIntervalRef.current);
-    if (currentLocation && selectedDestination) {
-      navIntervalRef.current = setInterval(() => {
-        const dest = getLocationById(selectedDestination);
-        if (!dest) return;
-        const info = calculateNavigation(currentLocation, dest);
-        setNavigationInfo(info);
-        if (info) speak(info.instruction);
-      }, 4000);
+    if (!hasLocationPermission) return;
+
+    let active = true;
+
+    const subscribeToLocation = async () => {
+      try {
+        const location = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.High,
+          timeout: 15000,
+          maximumAge: 1000
+        });
+
+        if (active) {
+          setCurrentLocation({
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+            heading: location.coords.heading || 0
+          });
+
+          locationSubscription.current = await Location.watchPositionAsync(
+            {
+              accuracy: Location.Accuracy.High,
+              timeInterval: 1000,
+              distanceInterval: 1
+            },
+            (locationUpdate) => {
+              const now = Date.now();
+              if (now - lastLocationTime.current > 1000) {
+                lastLocationTime.current = now;
+                setCurrentLocation({
+                  latitude: locationUpdate.coords.latitude,
+                  longitude: locationUpdate.coords.longitude,
+                  heading: locationUpdate.coords.heading || 0
+                });
+              }
+            }
+          );
+        }
+      } catch (error) {
+        console.warn('Location access error:', error);
+        setErrorMessage('Location unavailable: ' + (error.message || 'Timed out'));
+      }
+    };
+
+    subscribeToLocation();
+
+    return () => {
+      active = false;
+      if (locationSubscription.current) {
+        locationSubscription.current.remove();
+      }
+    };
+  }, [hasLocationPermission]);
+
+  // Update navigation info and path instructions
+  useEffect(() => {
+    if (!currentLocation || !selectedDestination) return;
+
+    const destination = getLocationById(selectedDestination);
+    if (!destination) return;
+
+    setDestinationLocation(destination);
+
+    const nav = calculateNavigation(currentLocation, destination);
+    setNavigationInfo(nav);
+
+    // Recompute path steps from current location to destination
+    const steps = getRouteSteps(currentLocation, {
+      latitude: destination.latitude,
+      longitude: destination.longitude,
+      name: destination.name
+    });
+    setRouteSteps(steps);
+    setRouteStepIndex(0);
+
+    const now = Date.now();
+    if (now - lastNavigationTime.current > 3000) {
+      lastNavigationTime.current = now;
+      speak(nav.instruction);
     }
     return () => clearInterval(navIntervalRef.current);
   }, [currentLocation, selectedDestination]);
 
-  // --- MAIN SCAN ---
-  const handleScan = async () => {
-    if (!cameraRef.current || isScanning) return;
-    setIsScanning(true);
-    speak('Scanning...');
+  useEffect(() => {
+    if (routeSteps.length === 0) return;
+    const current = routeSteps[Math.min(routeStepIndex, routeSteps.length - 1)];
+    if (!current) return;
+    speak(current.text);
+  }, [routeSteps, routeStepIndex]);
+
+  const analyzeCurrentScene = async () => {
+    if (!cameraRef.current || !cameraReady) return;
 
     try {
       const photo = await cameraRef.current.takePictureAsync({
