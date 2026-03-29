@@ -30,7 +30,8 @@
         "CAMERA",
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
-        "RECORD_AUDIO"
+        "RECORD_AUDIO",
+        "VIBRATE"
       ]
     },
     "web": {
@@ -51,7 +52,7 @@
         }
       ],
       [
-        "expo-av",
+        "expo-audio",
         {
           "microphonePermission": "CampusEyes needs microphone access for voice commands"
         }

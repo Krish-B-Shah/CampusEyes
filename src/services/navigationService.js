@@ -113,12 +113,12 @@ export const fetchRouteORS = async (lat1, lon1, lat2, lon2) => {
   }
 };
 
-// Multi-provider route fetcher: OSRM → ORS → straight-line fallback
+// Multi-provider route fetcher: ORS → OSRM → straight-line fallback
 export const fetchRouteWithFallback = async (lat1, lon1, lat2, lon2) => {
-  let route = await fetchRoute(lat1, lon1, lat2, lon2);
+  let route = await fetchRouteORS(lat1, lon1, lat2, lon2);
   if (route) return route;
 
-  route = await fetchRouteORS(lat1, lon1, lat2, lon2);
+  route = await fetchRoute(lat1, lon1, lat2, lon2);
   if (route) return route;
 
   return {
